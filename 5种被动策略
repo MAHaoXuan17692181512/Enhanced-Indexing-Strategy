@@ -1,0 +1,403 @@
+import pandas as pd
+import numpy as np
+import os
+from datetime import timedelta
+from scipy.optimize import minimize
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import warnings
+# --- 辅助设置（保持不变） ---
+warnings.filterwarnings('ignore')
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# -----------------------------
+
+class CSIPortfolioAnalysis:
+    def __init__(self, data_path):
+        self.data_path = data_path
+        self.adjustment_dates = None
+        self.price_data = None
+        self.constituent_data = None
+        # 简化版：仅加载回测所需的2023年及之后数据
+        self.price_files = {
+            '快照1':'中证500成分股数据-快照1.xlsx'
+        }
+
+    # --- 数据加载方法（精简结构，保留核心逻辑） ---
+
+    def load_adjustment_dates(self):
+        """加载成分股调整日期"""
+        file_path = os.path.join(self.data_path, "中证500成分股数据-快照1.xlsx")
+        try:
+            adj_df = pd.read_excel(file_path, sheet_name='调整日期汇总')
+            # 简化日期解析
+            adj_df['生效日期'] = pd.to_datetime(adj_df['生效日期'], errors='coerce')
+            adj_df = adj_df.dropna(subset=['生效日期'])
+
+            dates_map = {
+                f"{row['年份']}-{int(row['月份']):02d}": row['生效日期']
+                for _, row in adj_df.iterrows()
+                if '已获取' in str(row.get('状态', ''))
+            }
+            self.adjustment_dates = dict(sorted(dates_map.items(), key=lambda x: x[1]))
+        except Exception as e:
+            print(f"加载调整日期失败: {e}")
+
+    def load_all_price_data(self):
+        """加载所有价格数据并合并"""
+        all_prices = []
+        for filename in self.price_files.values():
+            try:
+                df = pd.read_excel(os.path.join(self.data_path, filename), sheet_name='Sheet1', header=0)
+                df = df.iloc[1:].set_index(df.columns[0])
+                df.index = pd.to_datetime(df.index)
+                all_prices.append(df)
+            except Exception as e:
+                print(f"加载 {filename} 失败: {e}")
+
+        if all_prices:
+            self.price_data = pd.concat(all_prices, axis=0)
+            self.price_data = self.price_data.sort_index().loc[~self.price_data.index.duplicated(keep='first')]
+        print(analyzer.price_data.shape)
+
+    def load_constituent_data(self):
+        """加载成分股状态矩阵"""
+        file_path = os.path.join(self.data_path, "中证500成分股数据-快照1.xlsx")
+        try:
+            df = pd.read_excel(file_path, sheet_name='成分股状态矩阵', header=0)
+            index_col_name = df.columns[14]
+            self.constituent_data = df.set_index(index_col_name)
+        except Exception as e:
+            print(f"加载成分股数据失败: {e}")
+
+    # --- 核心工具方法 ---
+
+    def calculate_log_returns(self, prices):
+        """计算对数收益率"""
+        prices = prices.apply(pd.to_numeric, errors='coerce').ffill()
+        return np.log(prices / prices.shift(1)).dropna(how='all')
+
+    def get_constituents_by_date(self, target_date):
+        """根据日期获取生效的成分股列表"""
+        ###这个函数可以找到先前的交易日期
+        if self.constituent_data is None or self.adjustment_dates is None: print("错误1")
+
+        target_date = pd.to_datetime(target_date)
+        prev_adj = next((d for d in reversed(self.adjustment_dates.values()) if d <= target_date), None)
+        ##next意为找到第一个条件就停止搜索
+        if prev_adj is None: print("没有找到先前调整日")
+
+        adj_key = next(k for k, v in self.adjustment_dates.items() if v == prev_adj)
+        target_col_name = f"是否成分股_{adj_key}"
+        print("成分股调整日期",target_col_name)
+
+        if target_col_name in self.constituent_data.columns:
+            constituents = self.constituent_data[self.constituent_data[target_col_name] == 1].index.tolist()
+            # 简化代码匹配逻辑
+            available_stocks = [
+                s for s in constituents
+                if s in self.price_data.columns or s.replace('sh.', '').replace('sz.', '') in self.price_data.columns
+            ]
+            return available_stocks
+            print("可获得股票为:",available_stocks)
+        else:print("错误2")
+        return []
+
+    def estimate_parameters_rolling(self, end_date, lookback_days=180):
+        """滚动估计均值和协方差矩阵"""
+        constituents = self.get_constituents_by_date(end_date)
+        if not constituents: print("没有日期的组成成分")
+
+        start_dt = end_date - timedelta(days=lookback_days)
+        period_prices = self.price_data[constituents].loc[start_dt:end_date].dropna(axis=1, how='all')
+        print(f"筛选后价格数据形状: {period_prices.shape}")
+
+        if period_prices.shape[0] < 180: print("数据不足180天")
+
+        # returns = self.calculate_log_returns(period_prices).dropna(axis=1) 这个不能删
+        returns = self.calculate_log_returns(period_prices)
+        if returns.empty: return None, None, []
+
+        mean_returns = returns.mean()
+        cov_matrix = returns.cov()
+
+        # 增加协方差矩阵的数值稳定性检查 (防止优化失败)
+        if np.linalg.cond(cov_matrix) > 1e10:
+            np.fill_diagonal(cov_matrix.values, cov_matrix.values.diagonal() + 1e-6)
+
+        if mean_returns.isnull().any() or cov_matrix.isnull().any().any(): print("没有协方差阵")
+
+        return mean_returns, cov_matrix, returns.columns.tolist()
+
+    # --- 策略优化方法（保持核心逻辑） ---
+    def markowitz_max_sharpe(self, mean_returns, cov_matrix, risk_free_rate=0.02, annual_factor=252):
+        n = len(mean_returns)
+
+        def neg_sharpe(w):
+            r = np.dot(w, mean_returns) * annual_factor ###因为是对数收益率
+            vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w))) * np.sqrt(annual_factor)  ##年波动率
+            return -(r - risk_free_rate) / vol
+
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        bounds = tuple((0, 1) for _ in range(n))
+        initial_weights = n * [1.0 / n]
+
+        result = minimize(neg_sharpe, initial_weights, method='SLSQP', bounds=bounds, constraints=constraints)
+        return result.x if result.success else None
+
+    def markowitz_min_risk(self, mean_returns, cov_matrix, annual_factor=252):
+        n = len(mean_returns)
+
+        def portfolio_vol(w):
+            return np.sqrt(np.dot(w.T, np.dot(cov_matrix, w))) * np.sqrt(annual_factor)
+
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        bounds = tuple((0, 1) for _ in range(n))
+        initial_weights = n * [1.0 / n]
+
+        result = minimize(portfolio_vol, initial_weights, method='SLSQP', bounds=bounds, constraints=constraints)
+        return result.x if result.success else None
+
+    def risk_parity(self, cov_matrix):
+        n = len(cov_matrix)
+
+        def rp_objective(w):
+            w = np.array(w)
+            if np.any(w < 0): print("风险平价权重小于0")
+
+            portfolio_vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w))) * np.sqrt(252) ##还是用年波动率
+
+            # 💡 增加防除零检查
+            if portfolio_vol < 1e-12: print("风险平价波动率太低")
+
+            risk_contributions = w * (np.dot(cov_matrix, w) / portfolio_vol)
+            target_rc = portfolio_vol / n
+            return np.sum((risk_contributions - target_rc) ** 2)
+
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        bounds = tuple((0, 1) for _ in range(n))
+        initial_weights = n * [1.0 / n]
+
+        result = minimize(rp_objective, initial_weights, method='SLSQP', bounds=bounds, constraints=constraints,
+                          tol=1e-6)
+        return result.x if result.success else None
+
+    def equal_weight(self, mean_returns, cov_matrix=None):
+        return np.ones(len(mean_returns)) / len(mean_returns)
+
+    def market_cap_weight(self, mean_returns, cov_matrix=None):
+        # 简化版：用等权代替
+        return self.equal_weight(mean_returns)
+
+    def backtest_portfolio(self, start_date='2023-01-01', end_date='2025-09-30'):
+        if self.price_data is None or self.price_data.empty:
+            return None
+
+        # 调仓日期（每3个月一次）
+        rebalance_dates_str = ['2023-01-01', '2023-04-01', '2023-07-01', '2023-10-01',
+                               '2024-01-01', '2024-04-01', '2024-07-01', '2024-10-01',
+                               '2025-01-01', '2025-04-01', '2025-07-01']
+        rebalance_dates = [pd.to_datetime(d) for d in rebalance_dates_str]
+
+        # 使用所有交易日，这样才能每日计算净值
+        trading_dates = self.price_data.index[
+            (self.price_data.index >= pd.to_datetime(start_date)) &
+            (self.price_data.index <= pd.to_datetime(end_date))
+            ]
+
+        strategies = {
+            'max_sharpe': self.markowitz_max_sharpe,
+            'min_variance': self.markowitz_min_risk,
+            'equal_weight': self.equal_weight,
+            'risk_parity': self.risk_parity,
+            'market_cap': self.market_cap_weight
+        }
+
+        portfolio_values = {name: 1 for name in strategies}
+        cumulative_returns = {name: pd.Series(dtype=float) for name in strategies}
+        current_weights = {name: {} for name in strategies}
+
+        for i, date in enumerate(trading_dates):
+
+            # 调仓逻辑：只在调仓日重新计算权重（每3个月一次）
+            if date in rebalance_dates:
+                print(f"=== 调仓日: {date.strftime('%Y-%m-%d')} ===")
+
+                mean_returns, cov_matrix, stocks_used = self.estimate_parameters_rolling(
+                    date, lookback_days=180
+                )
+
+                if mean_returns is not None:
+                    print(f"可投资股票数量: {len(stocks_used)}")
+                    for name, func in strategies.items():
+                        try:
+                            weights = None
+                            if name == 'risk_parity':
+                                weights = func(cov_matrix)
+                            elif name in ['max_sharpe', 'min_variance']:
+                                weights = func(mean_returns, cov_matrix)
+                            else:
+                                weights = func(mean_returns)
+
+                            if weights is not None:
+                                new_weights = {k: v for k, v in zip(stocks_used, weights) if v > 1e-6}
+                                total_weight = sum(new_weights.values())
+                                if total_weight > 0:
+                                    current_weights[name] = {k: v / total_weight for k, v in new_weights.items()}
+                                    print(f"{name}: 配置{len(new_weights)}只股票")
+                            else:
+                                print(f"{name}: 优化失败")
+                        except Exception as e:
+                            print(f"{name} 策略优化失败: {e}")
+                else:
+                    print("参数估计失败，保持原有权重")
+
+            # 每日计算净值（每天都要执行）
+            if i > 0:
+                yesterday = trading_dates[i - 1]
+
+                # 计算所有股票的价格变化
+                price_change = self.price_data.loc[date] / self.price_data.loc[yesterday]
+
+                for name in strategies:
+                    weights = current_weights[name]
+
+                    if weights and len(weights) > 0:
+                        portfolio_stocks = list(weights.keys())
+
+                        # 获取投资组合中股票的实际价格变化
+                        relevant_changes = price_change.loc[
+                            price_change.index.intersection(portfolio_stocks)
+                        ].dropna()
+
+                        if len(relevant_changes) > 0:
+                            # 对齐权重
+                            aligned_weights = pd.Series(weights).loc[relevant_changes.index]
+                            weight_sum = aligned_weights.sum()
+
+                            if weight_sum > 0:
+                                aligned_weights = aligned_weights / weight_sum
+                                daily_return_factor = np.dot(aligned_weights.values, relevant_changes.values)
+                                portfolio_values[name] *= daily_return_factor
+                        # 如果没有相关数据，净值保持不变
+                    else:
+                        # 如果没有权重（如第一天或优化失败），净值保持不变
+                        pass
+
+                    # 记录每日净值
+                    cumulative_returns[name].loc[date] = portfolio_values[name]
+
+            elif date == trading_dates[0]:
+                # 第一天，记录初始净值
+                for name in strategies:
+                    cumulative_returns[name].loc[date] = portfolio_values[name]
+
+        # 转换为收益率百分比
+        results_df = pd.DataFrame(cumulative_returns)
+        return (results_df - 1) * 100
+
+def plot_portfolio_performance(results_df):
+    """绘制投资组合累积收益率图表"""
+    if results_df is None or results_df.empty:
+        print("没有可用于绘制的投资组合回测结果。")
+        return
+
+    # 调试信息
+    print(f"回测结果数据形状: {results_df.shape}")
+    print(f"回测结果列名: {results_df.columns.tolist()}")
+    print(f"时间范围: {results_df.index.min()} 到 {results_df.index.max()}")
+
+    # 设置图形
+    plt.figure(figsize=(14, 8))
+
+    # 策略颜色和标签映射
+    strategy_config = {
+        'max_sharpe': {'color': 'red', 'label': '最大夏普比率', 'linestyle': '-'},
+        'min_variance': {'color': 'blue', 'label': '最小方差', 'linestyle': '--'},
+        'equal_weight': {'color': 'green', 'label': '等权重', 'linestyle': '-.'},
+        'risk_parity': {'color': 'orange', 'label': '风险平价', 'linestyle': ':'},
+        'market_cap': {'color': 'purple', 'label': '市值加权', 'linestyle': '-'}
+    }
+
+    # 绘制每条曲线
+    for strategy, config in strategy_config.items():
+        if strategy in results_df.columns:
+            data = results_df[strategy].dropna()
+            if len(data) > 0:
+                plt.plot(data.index, data.values,
+                         color=config['color'],
+                         label=config['label'],
+                         linestyle=config['linestyle'],
+                         linewidth=2,
+                         marker='o' if len(data) < 10 else '',  # 数据点少时显示标记点
+                         markersize=4)
+
+    # 设置图表样式
+    plt.title('投资组合累积收益率（2023-2025）', fontsize=16, fontweight='bold', pad=20)
+    plt.xlabel('日期', fontsize=12)
+    plt.ylabel('累积收益率 (%)', fontsize=12)
+    plt.legend(fontsize=10, loc='best')
+    plt.grid(True, alpha=0.3)
+    # plt.grid(False)
+
+    # 设置x轴日期格式
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    if len(results_df) > 50:  # 数据点多时每6个月显示一个标签
+        plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+    else:  # 数据点少时每个月显示一个标签
+        plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    plt.gcf().autofmt_xdate()  # 自动旋转日期标签
+
+    # 添加收益率为0的参考线
+    plt.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=1)
+
+    # 显示图表
+    plt.tight_layout()
+    plt.show()
+
+    # 输出最终收益率统计
+    print("\n各策略最终累积收益率统计：")
+    final_returns = {}
+    for strategy, config in strategy_config.items():
+        if strategy in results_df.columns:
+            final_return = results_df[strategy].iloc[-1] if not results_df[strategy].isna().all() else None
+            if final_return is not None:
+                final_returns[config['label']] = final_return
+
+    if final_returns:
+        for label, final_return in sorted(final_returns.items(), key=lambda item: item[1], reverse=True):
+            print(f"{label}: {final_return:.2f}%")
+    else:
+        print("没有有效的收益率数据")
+
+if __name__ == "__main__":
+    # 请确保此路径正确且包含所有文件
+    data_path = r"C:\Users\cufet\Desktop\测试集"
+
+    try:
+        analyzer = CSIPortfolioAnalysis(data_path)
+
+        print("--- 步骤 1: 数据加载 ---")
+        analyzer.load_adjustment_dates()
+        analyzer.load_all_price_data()
+        analyzer.load_constituent_data()
+
+        if analyzer.price_data is None or analyzer.constituent_data is None:
+            print("数据加载失败，无法进行回测。")
+            portfolio_results_df = None
+        else:
+            print("--- 步骤 2: 投资组合回测 ---")
+            portfolio_results_df = analyzer.backtest_portfolio(
+                start_date='2023-01-01',
+                end_date='2025-09-30'
+            )
+
+        if portfolio_results_df is not None:
+            plot_portfolio_performance(portfolio_results_df)
+
+    except Exception as e:
+        print(f"分析过程中出现错误: {e}")
