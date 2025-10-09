@@ -1,0 +1,225 @@
+##调整日期为每年6月和12月的第二个星期五的下一交易日
+import baostock as bs
+import pandas as pd
+import datetime
+from dateutil.relativedelta import relativedelta
+
+def get_adjustment_date(year, month):
+    """
+    计算中证500指数调整的实际生效日期
+    调整时间为每年6月和12月的第二个星期五的下一交易日
+    """
+    # 找到指定年份和月的第一个星期五
+    first_day = datetime.date(year, month, 1)
+
+    # 计算第一个星期五
+    days_until_first_friday = (4 - first_day.weekday()) % 7
+    first_friday = first_day + datetime.timedelta(days=days_until_first_friday)
+
+    # 第二个星期五 = 第一个星期五 + 7天
+    second_friday = first_friday + datetime.timedelta(days=7)
+
+    # 生效日期 = 第二个星期五的下一交易日（周一）
+    effective_date = second_friday + datetime.timedelta(days=3)
+
+    return effective_date
+
+
+def get_csi500_constituents(year, month):
+    """
+    获取指定年月的中证500成分股
+    """
+    # 登陆系统
+    lg = bs.login()
+
+    # 计算实际的调整生效日期
+    effective_date = get_adjustment_date(year, month)
+
+    # 格式化日期
+    query_date = effective_date.strftime("%Y-%m-%d")
+
+    print(f"{year}年{month}月调整信息:")
+    print(f"  第二个星期五: {effective_date - datetime.timedelta(days=3)}")
+    print(f"  生效日期(下一交易日): {effective_date}")
+
+    try:
+        # 查询中证500成分股
+        rs = bs.query_zz500_stocks(date=query_date)
+        print(f'  query_zz500 {year}-{month:02d} error_code:' + rs.error_code)
+        print(f'  query_zz500 {year}-{month:02d} error_msg:' + rs.error_msg)
+
+        # 处理结果集
+        csi500_stocks = []
+        while (rs.error_code == '0') & rs.next():
+            csi500_stocks.append(rs.get_row_data())
+
+        if csi500_stocks:
+            result = pd.DataFrame(csi500_stocks, columns=rs.fields)
+            result['调整年份'] = year
+            result['调整月份'] = month
+            result['调整生效日期'] = query_date
+            result['调整周期'] = f"{year}-{month:02d}"
+            return result
+        else:
+            print(f"  未找到 {year}-{month:02d} 的成分股数据")
+            return None
+
+    except Exception as e:
+        print(f"  获取 {year}-{month:02d} 数据时出错: {e}")
+        return None
+    finally:
+        # 登出系统
+        bs.logout()
+def create_constituent_matrix(all_data):
+    """
+    创建成分股状态矩阵，显示每个股票在每个调整周期是否是成分股
+    """
+    # 获取所有唯一的股票代码和名称
+    all_stocks = []
+    for df in all_data:
+        for _, row in df.iterrows():
+            stock_info = {
+                'code': row['code'],
+                # 'code_name': row['code_name']
+            }
+            if stock_info not in all_stocks:
+                all_stocks.append(stock_info)
+
+    # 创建基础DataFrame
+    constituent_df = pd.DataFrame(all_stocks)
+
+    # 获取所有调整周期并排序
+    all_periods = sorted(list(set([df['调整周期'].iloc[0] for df in all_data])))
+    print(all_periods)
+
+    # 为每个调整周期添加状态列
+
+    for period in all_periods:
+        # 找到该调整周期的数据 - 修正版
+        period_df = None
+        for df in all_data:
+            # 确保DataFrame中所有行的调整周期都相同，且等于目标周期
+            if not df.empty and (df['调整周期'] == period).all():
+                period_df = df
+                break
+
+        if period_df is not None:
+            # 创建该周期的成分股状态列
+            constituent_df[f'是否成分股_{period}'] = constituent_df['code'].isin(period_df['code']).astype(int)
+
+    return constituent_df, all_periods
+
+
+def main():
+    """
+    主函数：获取多年份的中证500成分股调整数据
+    """
+    print("=" * 60)
+    print("中证500指数调整规则")
+    print("样本每半年调整一次，调整时间为每年6月和12月的第二个星期五的下一交易日")
+    print("=" * 60)
+
+    # 设置要查询的年份范围（可以根据需要调整）
+    start_year = 2024
+    end_year = 2025
+
+    all_data = []
+    adjustment_dates = []
+
+    for year in range(start_year, end_year + 1):
+        for month in [6, 12]:  # 6月和12月调整
+            print(f"\n正在获取 {year}年{month}月 中证500成分股...")
+
+            # 计算调整日期
+            effective_date = get_adjustment_date(year, month)
+
+            # 检查日期是否在未来
+            current_date = datetime.datetime.now().date()
+            if effective_date > current_date:
+                print(f"  {year}年{month}月 的调整尚未发生（生效日期: {effective_date}），跳过")
+                adjustment_dates.append({
+                    '年份': year,
+                    '月份': month,
+                    '生效日期': effective_date,
+                    '状态': '未来调整'
+                })
+                continue
+
+            df = get_csi500_constituents(year, month)
+            if df is not None and not df.empty:
+                all_data.append(df)
+                adjustment_dates.append({
+                    '年份': year,
+                    '月份': month,
+                    '生效日期': effective_date,
+                    '状态': f'已获取 ({len(df)}只成分股)'
+                })
+                print(f"  成功获取 {year}年{month}月 数据，共 {len(df)} 只成分股")
+            else:
+                adjustment_dates.append({
+                    '年份': year,
+                    '月份': month,
+                    '生效日期': effective_date,
+                    '状态': '获取失败'
+                })
+
+    if all_data:
+        # 合并所有数据
+        final_result = pd.concat(all_data, ignore_index=True)
+
+        # 输出到Excel文件
+        output_file = "C:/Users/cufet/Desktop/中证500成分股数据.xlsx"
+
+        # 使用ExcelWriter创建多个sheet
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # 总表
+            final_result.to_excel(writer, sheet_name='全部调整数据', index=False)
+
+            # 调整日期汇总表
+            adjustment_df = pd.DataFrame(adjustment_dates)
+            adjustment_df.to_excel(writer, sheet_name='调整日期汇总', index=False)
+
+            # 按调整周期分别保存到不同sheet
+            for period in final_result['调整周期'].unique():
+                period_data = final_result[final_result['调整周期'] == period]
+                sheet_name = f"{period}调整"
+                # Excel sheet名称长度限制
+                if len(sheet_name) > 31:
+                    sheet_name = sheet_name[:31]
+                period_data.to_excel(writer, sheet_name=sheet_name, index=False)
+
+            # 创建统计表
+            stats = final_result.groupby('调整周期').agg({
+                'code': 'count',
+                '调整生效日期': 'first'
+            }).reset_index()
+            stats.columns = ['调整周期', '成分股数量', '生效日期']
+            stats.to_excel(writer, sheet_name='统计信息', index=False)
+
+        print(f"\n数据已成功导出到: {output_file}")
+        print(f"总记录数: {len(final_result)}")
+        print(f"调整周期数: {len(final_result['调整周期'].unique())}")
+
+        # 显示统计信息
+        print("\n各调整周期成分股数量统计:")
+        for period in sorted(final_result['调整周期'].unique()):
+            count = len(final_result[final_result['调整周期'] == period])
+            effective_date = final_result[final_result['调整周期'] == period]['调整生效日期'].iloc[0]
+            print(f"  {period}: {count}只成分股 (生效日期: {effective_date})")
+
+    else:
+        print("未获取到任何数据")
+
+    # 显示调整日期汇总
+    print("\n调整日期汇总:")
+    adjustment_df = pd.DataFrame(adjustment_dates)
+    print(adjustment_df.to_string(index=False))
+    if all_data:
+        constituent_matrix, all_periods = create_constituent_matrix(all_data)
+        matrix_output_file = "C:/Users/cufet/Desktop/中证500成分股状态矩阵.xlsx"
+        constituent_matrix.to_excel(matrix_output_file, index=False)
+        print(f"\n成分股状态矩阵已导出到: {matrix_output_file}")
+        print(f"矩阵包含 {len(constituent_matrix)} 只股票，{len(all_periods)} 个调整周期")
+#
+if __name__ == "__main__":
+    main()
