@@ -1,0 +1,59 @@
+import pandas as pd
+import numpy as np
+
+# 从 Excel 读取
+df = pd.read_excel(r"C:\Users\cufet\Desktop\LASSO_Factor_Results.xlsx")
+def process_duplicates(df, method='first'):
+    if df.duplicated(subset=['date', 'code']).sum() == 0:
+        return df
+
+    print(f"使用 '{method}' 方法处理重复值")
+    return df.groupby(['date', 'code'])['LASSO_Factor'].agg(method).reset_index()
+
+
+# 选择处理方法
+df_clean = process_duplicates(df, method='mean')  # 或者 'first', 'last' 等
+
+# 继续转换流程
+df_clean['date'] = pd.to_datetime(df_clean['date']).dt.date
+df_wide = df_clean.pivot(index='date', columns='code', values='LASSO_Factor')
+df_wide = df_wide.sort_index()
+
+print("转换后的数据：")
+print(df_wide)
+
+# 严格版本：确保每行正好有50个1
+def mark_exact_top_50(row):
+    valid_values = row.dropna()
+    marks = pd.Series(0, index=row.index)
+
+    if len(valid_values) == 0:
+        return marks
+
+    n_mark = min(100, len(valid_values))
+
+    top_indices = valid_values.nlargest(n_mark).index
+    marks[top_indices] = 1
+
+    return marks
+
+df_top50_strict = df_wide.apply(mark_exact_top_50, axis=1)
+
+print("\n严格版本 - 每行标记数量统计：")
+print(df_top50_strict.sum(axis=1).describe())
+
+# 保存到Excel
+with pd.ExcelWriter('转换后数据.xlsx') as writer:
+    df_wide.to_excel(writer, sheet_name='Sheet1')
+    df_top50_strict.to_excel(writer, sheet_name='Sheet2')
+
+    # 添加统计信息
+    stats_df = pd.DataFrame({
+        '每行标记为1的数量': df_top50_strict.sum(axis=1),
+        '总股票数量': len(df_top50_strict.columns)
+    })
+    stats_df.to_excel(writer, sheet_name='统计信息')
+
+print("\n保存完成！")
+print(f"数据形状: {df_wide.shape}")
+print(f"标记数据形状: {df_top50_strict.shape}")
