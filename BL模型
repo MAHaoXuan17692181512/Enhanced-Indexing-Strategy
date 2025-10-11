@@ -1,0 +1,866 @@
+####中间的数据借口获取成分股历史市值是可行的，但是会被接口拒绝
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from collections import Counter
+import akshare as ak
+
+FILE_PATH = r"C:\Users\cufet\Desktop\图片\中证500成分股数据-快照1.xlsx"
+WINDOW = 365
+ANNUALIZATION_FACTOR = 365
+
+# 你想计算的特定日期列表
+# 注意：如果 1/1 或 7/1 是非交易日，我们会尝试匹配到该日期计算出的协方差结果
+TARGET_DATES = [
+    datetime(2023, 1, 1),
+    datetime(2023, 7, 1),
+    datetime(2024, 1, 1),
+    datetime(2024, 7, 1),
+    datetime(2025, 1, 1),
+    datetime(2025, 7, 1),
+]
+
+# --- 1. 数据读取与预处理 ---
+# --- 1. 数据读取与预处理 (修正顺序) ---
+
+try:
+    df_sheet1 = pd.read_excel(FILE_PATH, sheet_name='Sheet1', header=0)
+    df_sheet2 = pd.read_excel(FILE_PATH, sheet_name='Sheet2', header=0)
+except FileNotFoundError:
+    print("错误：无法找到Excel文件，请检查文件路径。")
+    exit()
+stock_codes_raw = df_sheet1.columns[1:].tolist()
+print(stock_codes_raw)
+formatted_stock_codes = []
+for code in stock_codes_raw:
+    parts = code.split('.')
+    if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 6:
+        # 提取纯数字代码，如从 '600006.SH' 提取 '600006'
+        symbol = parts[0]
+        formatted_stock_codes.append(symbol)
+    else:
+        # 处理可能的错误数据
+        print(f"警告：跳过非标准代码格式: {code}")
+        pass
+
+stock_codes = formatted_stock_codes
+print("转换后的股票代码列表 (纯数字格式):")
+print(stock_codes)
+
+# 1.1 提取并修正股票代码 (Excel的第二行)
+# 原始的 df_sheet1.iloc[0] 包含了股票代码行和左上角的那个空/日期单元格值
+# 我们只取股票代码部分，并从 df_sheet1 中删除这两行标题/代码行
+stock_codes = df_sheet1.iloc[0].tolist()[1:] # ***修正点：[1:] 排除第一列的日期标题***
+df_sheet1 = df_sheet1.iloc[1:].copy() # 删除作为代码的第二行 (原Excel的第二行)
+# df_sheet1 现在只剩下数据，列名仍然是 Excel 的第一行标题 ('日期', '股票1', '股票2', ...)
+
+# 1.2 设置日期索引
+df_sheet1.iloc[:, 0] = pd.to_datetime(df_sheet1.iloc[:, 0])
+# 这一步将第一列日期设置为索引，DataFrame 自动只剩下股票价格列
+df_sheet1.set_index(df_sheet1.columns[0], inplace=True)
+
+# 1.3 处理重复列名并设置列名（解决 InvalidIndexError）
+duplicates = [item for item, count in Counter(stock_codes).items() if count > 1]
+if duplicates:
+    # 自动为重复列名加后缀
+    df_sheet1.columns = pd.Index(stock_codes).make_unique()
+else:
+    # ***修正点：现在 stock_codes 的长度和 df_sheet1 的列数应该匹配了***
+    df_sheet1.columns = stock_codes
+
+# 1.4 转换为数值型并清理
+df_sheet1 = df_sheet1.apply(pd.to_numeric, errors='coerce')
+df_sheet1.dropna(how='all', inplace=True)
+df_sheet1.dropna(axis=1, how='all', inplace=True)
+
+print(f"数据处理完成。股票数量: {len(df_sheet1.columns)}")
+
+# --- 2. 协方差矩阵计算函数 ---
+# --- 2. 协方差矩阵计算函数 (手动计算目标窗口) ---
+def calculate_target_covariances(df, target_dates, window, annualization_factor):
+    """
+    计算特定日期的滚动协方差矩阵，通过手动切片避免计算所有日期的协方差。
+    """
+    results = {}
+
+    print("\n步骤 1/3: 计算每日对数收益率 (全数据集)...")
+    # 对数收益率仍需在全数据集上计算一次
+    log_returns = np.log(df / df.shift(1))
+
+    # 找到 log_returns 中所有可以计算的日期（跳过第一个 NaN）
+    available_dates = log_returns.index[log_returns.notna().all(axis=1)]
+
+    print("步骤 2/3: 遍历目标日期并手动计算窗口协方差...")
+
+    # 遍历目标日期
+    for target_date in target_dates:
+
+        # 1. 确定实际计算日期 (处理非交易日)
+        if target_date not in df.index:
+            # 找到目标日期或其之后的第一个交易日作为实际计算日
+            if available_dates.empty or target_date > available_dates.max():
+                print(f"  警告：目标 {target_date.date()} 之后没有可用数据。跳过。")
+                continue
+
+            # 找到目标日期或其之后的第一个**有数据**的日期
+            calculated_date = available_dates[available_dates >= target_date].min()
+            if pd.isna(calculated_date):
+                print(f"  警告：目标 {target_date.date()} 之后没有可用数据。跳过。")
+                continue
+
+            print(f"  目标 {target_date.date()} (非交易日)。使用 {calculated_date.date()} 进行计算。")
+        else:
+            calculated_date = target_date
+            print(f"  正在计算 {calculated_date.date()} 的协方差...")
+
+        # 2. 确定窗口起始日期
+        try:
+            current_idx = df.index.get_loc(calculated_date)
+            # 找到窗口的起始日期
+            start_date = df.index[current_idx - window + 1]
+        except (IndexError, KeyError) as e:
+            print(f"  警告：{calculated_date.date()} 太早，无法计算完整的 {window} 天窗口。跳过。")
+            continue
+
+        # 3. 核心计算：切片并计算 cov()
+        # 仅切出目标窗口内的对数收益率数据
+        window_log_returns = log_returns.loc[start_date:calculated_date]
+
+        # 计算该窗口的日协方差矩阵
+        current_cov_daily = window_log_returns.cov()
+        # 强制转换为统一的数值类型
+        print("  正在转换数据类型...")
+        current_cov_numeric = current_cov_daily.apply(pd.to_numeric, errors='coerce')
+        # 检查转换后的NaN值
+        nan_count = current_cov_numeric.isna().sum().sum()
+        if nan_count > 0:
+            print(f"  警告: 转换后有 {nan_count} 个NaN值，使用0填充")
+            current_cov_numeric = current_cov_numeric.fillna(1e-5)
+
+        print(f"  转换后数据类型: {current_cov_numeric.dtypes.iloc[0]}")
+        current_cov = current_cov_numeric * annualization_factor
+
+        # 4. 计算滚动均值 (始末价格收益率)
+        annual_return = (df.loc[calculated_date] / df.loc[start_date]) - 1
+
+        # 5. 存储结果
+        result_entry = {
+            'rolling_mean': annual_return,
+            'rolling_cov': current_cov,
+        }
+        if target_date != calculated_date:
+            result_entry['calculated_on'] = calculated_date
+
+        results[target_date] = result_entry
+        print(f"  √ 计算完成，协方差矩阵维度: {current_cov.shape[0]} x {current_cov.shape[1]}")
+        print(f"  === 协方差矩阵调试信息 ===")
+        print(f"  current_cov 类型: {type(current_cov)}")
+        print(f"  current_cov 形状: {getattr(current_cov, 'shape', 'No shape')}")
+        print(f"  current_cov 数据类型: {getattr(current_cov, 'dtype', 'No dtype')}")
+
+    return results
+
+
+# --- 3. 执行计算与输出 ---
+# (剩余的代码保持不变，因为函数接口没有变)
+
+print("\n--- 开始计算指定日期的协方差矩阵 (手动切片模式) ---")
+
+# 执行计算
+rolling_stats = calculate_target_covariances(
+    df_sheet1, TARGET_DATES, WINDOW, ANNUALIZATION_FACTOR
+)
+
+# --- 4. 结果展示 ---
+print("\n" + "=" * 40)
+print("协方差阵计算完成")
+print("=" * 40)
+
+for date, data in rolling_stats.items():
+    calculated_date = data.get('calculated_on', date)
+    print(
+        f"\n目标日期: {date.date()}" + (f" (实际计算日: {calculated_date.date()})" if date != calculated_date else ""))
+
+    # 协方差矩阵维度
+    cov_shape = data['rolling_cov'].shape
+    print(f"  协方差矩阵维度: {cov_shape[0]} x {cov_shape[1]}")
+
+    # 均值预览 (仅显示前 5 个)
+    print("  滚动年化均值 (前5支股票):")
+    print(data['rolling_mean'].head().to_string())
+
+# --- 第二步: 提取 Sheet2 中的风险溢价 ---
+
+# 假设 H 列为日期（索引 7），I 列为风险溢价（索引 8）
+RP_DATE_COL_INDEX = 3
+RP_VALUE_COL_INDEX = 6
+
+print("\n--- 第二步: 提取 Sheet2 风险溢价 ---")
+
+# 1. 提取 H 列日期和 I 列风险溢价值
+rp_dates = df_sheet2.iloc[:, RP_DATE_COL_INDEX]
+rp_values = df_sheet2.iloc[:, RP_VALUE_COL_INDEX]
+
+# 2. 清理数据并创建风险溢价 Series
+try:
+    # 尝试将日期列转换为 datetime 对象
+    rp_dates = pd.to_datetime(rp_dates, errors='coerce')
+    # 尝试将风险溢价列转换为数值型
+    rp_values = pd.to_numeric(rp_values, errors='coerce')
+except Exception as e:
+    print(f"数据转换失败：{e}")
+    exit()
+
+# 3. 移除任何包含 NaN 的行并创建 Series
+valid_mask = rp_dates.notna() & rp_values.notna()
+risk_premium_series = pd.Series(rp_values[valid_mask].values, index=rp_dates[valid_mask])
+risk_premium_series = risk_premium_series.sort_index()
+
+print(f"Sheet2 风险溢价数据时间范围: {risk_premium_series.index.min().date()} 到 {risk_premium_series.index.max().date()}")
+
+# 4. 针对 TARGET_DATES 进行提取（使用 ffill 确保找到最近的数据）
+# 提取 TARGET_DATES 列表中的日期
+target_rp_data = risk_premium_series.reindex(TARGET_DATES, method='ffill')
+
+# --- 结果展示 ---
+print("\n" + "=" * 40)
+print("目标日期对应的风险溢价:")
+print("=" * 40)
+print(target_rp_data.to_string())
+
+###第三步，计算6个时间点的先验分布
+###这种频繁且暴力的处理方式会被akshare强制中断
+# def get_market_values_for_dates(codes, dates):
+#     """
+#     通过循环获取每只股票在给定日期或最近交易日的总市值数据。
+#     直接搜索给定日期的收盘价，结合总股本计算市值。
+#
+#     Args:
+#         codes (list): 股票代码列表。
+#         dates (list): 目标日期列表 (datetime对象)。
+#
+#     Returns:
+#         pd.DataFrame: 索引为日期，列为股票代码的总市值DataFrame。
+#     """
+#     all_market_caps = {}
+#
+#     print("--- 步骤 1: 循环获取每只股票的市值数据 ---")
+#
+#     for code in codes:
+#         try:
+#             print(f"  正在处理 {code}...")
+#
+#             # 1. 获取该股票的最新总股本信息
+#             df_stock_info = ak.stock_individual_info_em(symbol=code)
+#             if df_stock_info.empty:
+#                 print(f"    ✗ 无法获取股票信息")
+#                 continue
+#
+#             info_indexed = df_stock_info.set_index('item')
+#
+#             # 提取总股本，单位是"股"
+#             if '总股本' in info_indexed.index:
+#                 total_shares = info_indexed.loc['总股本', 'value']
+#                 print(f"    总股本: {total_shares:.0f} 股")
+#             else:
+#                 print(f"    ✗ 无法获取总股本信息")
+#                 continue
+#
+#             # 2. 获取历史行情数据 - 只获取必要的数据范围
+#             # 确定日期范围：最早的目标日期到最晚的目标日期
+#             min_date = min(dates)
+#             max_date = max(dates)
+#
+#             # 扩展一些日期范围以确保覆盖
+#             start_date = (min_date - timedelta(days=30)).strftime('%Y%m%d')
+#             end_date = (max_date + timedelta(days=30)).strftime('%Y%m%d')
+#
+#             df_hist = ak.stock_zh_a_hist(
+#                 symbol=code,
+#                 period="daily",
+#                 start_date=start_date,
+#                 end_date=end_date,
+#                 adjust="qfq"
+#             )
+#
+#             if df_hist.empty:
+#                 print(f"    ✗ 历史数据返回为空")
+#                 continue
+#
+#             # 3. 处理历史数据
+#             df_hist['日期'] = pd.to_datetime(df_hist['日期'])
+#             df_hist.set_index('日期', inplace=True)
+#
+#             # 4. 直接搜索目标日期的收盘价并计算市值
+#             target_market_cap = {}
+#             for target_date in dates:
+#                 # 找到目标日期或之前最近的交易日
+#                 available_dates = df_hist.index[df_hist.index <= target_date]
+#                 if len(available_dates) > 0:
+#                     nearest_date = available_dates.max()
+#                     if nearest_date in df_hist.index:
+#                         closing_price = df_hist.loc[nearest_date, '收盘']
+#                         # 计算总市值并转换为亿元
+#                         market_cap = (total_shares * closing_price) / 100000000
+#                         target_market_cap[target_date] = market_cap
+#                         print(f"    {target_date.date()} -> {nearest_date.date()}: {market_cap:.2f} 亿元")
+#                     else:
+#                         target_market_cap[target_date] = np.nan
+#                         print(f"    {target_date.date()} -> 无收盘价数据")
+#                 else:
+#                     target_market_cap[target_date] = np.nan
+#                     print(f"    {target_date.date()} -> 无历史数据")
+#
+#             all_market_caps[code] = pd.Series(target_market_cap)
+#             print(f"  √ 已获取 {code} 的市值数据")
+#
+#         except Exception as e:
+#             print(f"  ✗ 错误：获取 {code} 数据失败。原因: {e}")
+#             continue
+#
+#     # 3. 结果合并
+#     if all_market_caps:
+#         df_market_cap = pd.DataFrame(all_market_caps)
+#         return df_market_cap
+#     else:
+#         return pd.DataFrame()
+#
+#
+# # --- 执行代码 ---
+# df_market_cap_result = get_market_values_for_dates(formatted_stock_codes, TARGET_DATES)
+#
+# # --- 结果展示 ---
+# print("\n" + "=" * 50)
+# print("给定日期总市值结果 (单位: 亿元)")
+# print("=" * 50)
+# print(df_market_cap_result.round(2))  # 保留两位小数
+
+###等权
+# --- 第三步: 计算加权组合 ---
+print("\n--- 第三步: 计算加权组合 (协方差 × 风险溢价 × 等权重) ---")
+
+# 等权重设置 (假设所有股票等权重)
+n_stocks = len(df_sheet1.columns)
+equal_weight = np.ones(n_stocks) / n_stocks
+print(f"等权重向量维度: {equal_weight.shape}, 每只股票权重: {1 / n_stocks:.4f}")
+
+# 存储最终结果
+portfolio_results = {}
+
+for date in TARGET_DATES:
+    if date not in rolling_stats:
+        print(f"跳过 {date.date()} - 无协方差数据")
+        continue
+
+    if date not in target_rp_data.index:
+        print(f"跳过 {date.date()} - 无风险溢价数据")
+        continue
+
+    # 获取该日期的协方差矩阵和风险溢价
+    cov_matrix = rolling_stats[date]['rolling_cov']
+    risk_premium = target_rp_data[date]
+
+    print(f"\n计算日期: {date.date()}")
+    print(f"  风险溢价: {risk_premium:.6f}")
+    print(f"  协方差矩阵维度: {cov_matrix.shape}")
+
+    # 核心计算: 协方差 × 风险溢价 × 权重
+    try:
+        # 第一步: 协方差矩阵 × 风险溢价
+        if isinstance(cov_matrix, pd.DataFrame):
+            # 方法1: 使用 .values 并确保数据类型
+            cov_matrix = cov_matrix.values.astype(np.float64)
+
+        equal_weight = equal_weight.astype(np.float64)
+
+        # 2. 检查并处理NaN值
+        nan_count = np.isnan(cov_matrix).sum()
+        if nan_count > 0:
+            print(f"  警告: 协方差矩阵中有 {nan_count} 个NaN值，使用0填充")
+            cov_matrix = np.nan_to_num(cov_matrix, nan=0.0)
+
+        # 3. 检查矩阵对称性和正定性
+        if not np.allclose(cov_matrix, cov_matrix.T):
+            print("  警告: 协方差矩阵不对称，进行对称化处理")
+            cov_matrix = (cov_matrix + cov_matrix.T) / 2
+        cov_times_rp = cov_matrix * risk_premium
+        print(f"  协方差×风险溢价矩阵维度: {cov_times_rp.shape}")
+
+        # 第二步: 乘以等权重向量
+        # 这里使用矩阵乘法: (n×n) × (n×1) = (n×1)
+        portfolio_vector = cov_times_rp @ equal_weight
+        # 或者使用: portfolio_vector = np.dot(cov_times_rp, equal_weight)
+
+        print(f"  最终组合向量维度: {portfolio_vector.shape}")
+
+        # 存储结果
+        portfolio_results[date] = {
+            'risk_premium': risk_premium,
+            'cov_matrix': cov_matrix,
+            'portfolio_vector': portfolio_vector,
+            'calculated_on': rolling_stats[date].get('calculated_on', date)
+        }
+
+        # 显示前几只股票的结果预览
+        print("  前5只股票的结果:")
+        for i, (stock_code, value) in enumerate(zip(stock_codes_raw[:5], portfolio_vector[:5])):
+            print(f"    {stock_code}: {value:.8f}")
+
+    except Exception as e:
+        print(f"  计算失败: {e}")
+
+# --- 最终结果汇总 ---
+print("\n" + "=" * 50)
+print("最终结果汇总")
+print("=" * 50)
+
+# --- 输出结果到Excel (最简洁版本) ---
+if portfolio_results:
+    pd.DataFrame(
+        {date: data['portfolio_vector'] for date, data in portfolio_results.items()},
+        index=stock_codes_raw[:len(next(iter(portfolio_results.values()))['portfolio_vector'])]
+    ).to_excel("BL_收益率先验结果.xlsx")
+    print("√ 结果已保存到 BL_收益率先验结果.xlsx")
+
+
+# ===== 以下是新增的Black-Litterman步骤代码 =====
+
+# --- 第一步: 读入矩阵P并处理 ---
+def load_and_process_P(P_file_path, BL_stock_codes):
+    """
+    读入矩阵P，并与BL结果的股票代码对齐
+
+    Args:
+        P_file_path: P矩阵的Excel文件路径
+        BL_stock_codes: BL结果中的股票代码列表
+
+    Returns:
+        P_aligned: 对齐后的P矩阵
+    """
+    # 读入P矩阵
+    P_raw = pd.read_excel(P_file_path, sheet_name='Sheet2',index_col=0)
+    print(f"原始P矩阵形状: {P_raw.shape}")
+    print(f"P矩阵包含股票代码数量: {len(P_raw.columns)}")
+
+    # 创建与BL结果相同维度的全零矩阵
+    P_aligned = pd.DataFrame(
+        np.zeros((len(P_raw), len(BL_stock_codes))),
+        index=P_raw.index,  # 保持原来的日期索引
+        columns=BL_stock_codes  # 使用BL结果的股票代码
+    )
+
+    # 将P矩阵中存在的股票代码数据填充到对齐矩阵中
+    common_stocks = set(P_raw.columns) & set(BL_stock_codes)
+    for stock in common_stocks:
+        P_aligned[stock] = P_raw[stock]
+
+    print(f"对齐后P矩阵形状: {P_aligned.shape}")
+    print(f"共对齐 {len(common_stocks)} 只股票")
+    print(P_aligned)
+
+    return P_aligned
+
+
+# --- 第二步: 计算Ω矩阵 ---
+def calculate_Omega(P, cov_matrix, tau=0.1):
+    tau_Sigma = tau * cov_matrix
+    P_tau_Sigma_PT = P @ tau_Sigma @ P.T
+    # 取对角线元素构成对角矩阵
+    Omega = np.diag(np.diag(P_tau_Sigma_PT))
+    print(f"Ω矩阵形状: {Omega.shape}")
+    print(f"Ω矩阵对角线元素范围: [{Omega.diagonal().min():.8f}, {Omega.diagonal().max():.8f}]")
+
+    return Omega
+
+
+# --- 第三步: 计算Q向量 ---
+def calculate_Q(P, mu, Omega=None, views=None):
+    """
+    计算主观收益率向量Q
+
+    Args:
+        P: 观点矩阵 (k×n)
+        mu: 先验收益率向量 (n×1)
+        Omega: 观点置信度矩阵 (k×k)，可选
+        views: 主观观点向量 (k×1)，如果为None则使用P@mu
+
+    Returns:
+        Q: 主观收益率向量 (k×1)
+    """
+    if views is not None:
+        # 如果有明确的主观观点值
+        Q = np.array(views).reshape(-1, 1)
+    else:
+        # Q = Pμ + ε_q，这里ε_q均值为0，在后续计算中考虑
+        Q = P @ mu + np.random.multivariate_normal(np.zeros(Omega.shape[0]), Omega).reshape(-1, 1)
+
+    print(f"Q向量形状: {Q.shape}")
+    print(f"Q向量范围: [{Q.min():.8f}, {Q.max():.8f}]")
+
+    return Q
+
+
+# --- 主执行函数 ---
+def execute_BL_steps(P_file_path, BL_results, tau=0.05, views=None):
+    """
+    执行Black-Litterman的三个步骤
+
+    Args:
+        P_file_path: P矩阵文件路径
+        BL_results: 之前计算的BL结果字典
+        tau: 信心程度参数
+        views: 主观观点向量列表
+
+    Returns:
+        results: 包含P, Omega, Q的结果字典
+    """
+    results = {}
+
+    # 获取BL结果中的股票代码（从第一个日期的portfolio_vector长度获取）
+    if not BL_results:
+        print("错误: 无有效的BL结果")
+        return results
+
+    # 获取股票代码（使用之前计算中使用的股票代码）
+    first_date = list(BL_results.keys())[0]
+    BL_stock_codes = stock_codes_raw[:len(BL_results[first_date]['portfolio_vector'])]
+
+    # 第一步: 处理P矩阵
+    print("=== 第一步: 读入并处理P矩阵 ===")
+    P_aligned = load_and_process_P(P_file_path, BL_stock_codes)
+    results['P'] = P_aligned
+
+    # 对每个日期分别计算
+    for date, bl_data in BL_results.items():
+        print(f"\n=== 处理日期: {date} ===")
+
+        # 获取该日期的协方差矩阵和组合向量
+        cov_matrix = bl_data['cov_matrix']
+        portfolio_vector = bl_data['portfolio_vector']####先验均值
+
+        # 第二步: 计算Ω
+        print("=== 第二步: 计算Ω矩阵 ===")
+        Omega = calculate_Omega(P_aligned.values, cov_matrix, tau)
+
+        # 第三步: 计算Q
+        print("=== 第三步: 计算Q向量 ===")
+        # 使用组合向量作为先验收益率估计
+        Q = calculate_Q(P_aligned.values, portfolio_vector.reshape(-1, 1), Omega, views)
+
+        # 存储结果
+        results[date] = {
+            'P': P_aligned,
+            'Omega': Omega,
+            'Q': Q,
+            'cov_matrix': cov_matrix,
+            'portfolio_vector': portfolio_vector
+        }
+
+    return results
+
+
+# --- 执行Black-Litterman步骤 ---
+print("\n" + "=" * 60)
+print("开始执行Black-Litterman模型步骤")
+print("=" * 60)
+
+# 设置P矩阵文件路径（需要你提供实际路径）
+P_FILE_PATH = r"C:\Users\cufet\Desktop\转换后数据.xlsx"  # 请修改为实际路径
+
+try:
+    # 执行三个步骤
+    BL_steps_results = execute_BL_steps(
+        P_file_path=P_FILE_PATH,
+        BL_results=portfolio_results,  # 使用之前计算的BL结果
+        tau=0.1,
+        views=None  # 可以传入具体观点或使用None自动计算
+    )
+
+    # 保存结果
+    if BL_steps_results:
+        # 创建Excel写入器
+        with pd.ExcelWriter("BL_完整结果.xlsx") as writer:
+            # 保存先验结果
+            pd.DataFrame(
+                {date: data['portfolio_vector'] for date, data in portfolio_results.items()},
+                index=stock_codes_raw[:len(next(iter(portfolio_results.values()))['portfolio_vector'])]
+            ).to_excel(writer, sheet_name='先验收益率')
+
+            # 保存P矩阵
+            BL_steps_results['P'].to_excel(writer, sheet_name='P矩阵')
+
+            # 保存每个日期的Ω和Q
+            for date, data in BL_steps_results.items():
+                if date != 'P':  # 跳过P矩阵本身
+                    # pd.DataFrame(data['Omega']).to_excel(writer, sheet_name=f'{date.date()}_Omega')
+                    # pd.DataFrame(data['Q']).to_excel(writer, sheet_name=f'{date.date()}_Q')
+                    pd.DataFrame(data['Omega'], index=BL_steps_results['P'].index).to_excel(writer,
+                                                                                            sheet_name=f'{date.date()}_Omega')
+                    pd.DataFrame(data['Q'], index=stock_codes_raw[:len(data['Q'])], columns=['Q_value']).to_excel(writer, sheet_name=f'{date.date()}_Q')
+
+        print("\n√ 所有Black-Litterman结果已保存到 BL_完整结果.xlsx")
+        print("  包含: 先验收益率, P矩阵, 各日期Ω矩阵, 各日期Q向量")
+
+except FileNotFoundError:
+    print(f"✗ 找不到P矩阵文件: {P_FILE_PATH}")
+    print("请确保P矩阵文件路径正确")
+except Exception as e:
+    print(f"✗ Black-Litterman步骤执行失败: {e}")
+
+print("\n" + "=" * 60)
+print("程序执行完成")
+print("=" * 60)
+
+# --- 提取指定日期的非零元素 ---
+print("\n" + "=" * 60)
+print("提取指定日期的非零元素")
+print("=" * 60)
+
+try:
+    nonzero_results = []
+
+    # 只处理TARGET_DATES中的日期
+    for target_date in TARGET_DATES:
+        if target_date in BL_steps_results and target_date in portfolio_results:
+            data = BL_steps_results[target_date]
+            portfolio_data = portfolio_results[target_date]
+            print(f"\n处理指定日期: {target_date.date()}")
+            # 获取该日期的cov_matrix、P矩阵、Q向量、Ω矩阵
+            cov_matrix = portfolio_data['cov_matrix']
+            P_matrix = data['P']
+            Q_vector = data['Q']
+            Omega_matrix = data['Omega']
+            portfolio_vector_before = data['portfolio_vector']
+
+
+            # 获取该日期的sigma(cov_matrix)、P矩阵、Q向量、Ω矩阵
+            P_df = BL_steps_results['P']
+            # P_matrix_one = data['P'].loc[target_date]
+            nearest_date = data['P'].index[data['P'].index >= target_date][0]
+            P_matrix_one = data['P'].loc[[nearest_date]]
+            date_index = data['P'].index.get_loc(nearest_date)####这是因为P和Q的结构相同
+            Q_vector_one = data['Q'][date_index]  # 直接使用索引位置
+            # 使用向后查找方法
+            indexer = P_df.index.get_indexer([target_date], method='backfill')[0]
+            if indexer != -1:
+                date_index = indexer
+                actual_date = P_df.index[date_index]
+                print(f"目标日期: {target_date.date()}, 实际使用的日期: {actual_date.date()}, 位置: {date_index}")
+
+                if actual_date != target_date:
+                    print(f"注意: 使用近似日期 {actual_date.date()} 代替目标日期 {target_date.date()}")
+            else:
+                print(f"警告: 无法为日期 {target_date.date()} 找到任何匹配的日期")
+                continue
+
+            if date_index < Omega_matrix.shape[0]:
+                omega_value = Omega_matrix[date_index, date_index]
+                print(f"获取Ω矩阵对角线上的第{date_index}个元素: {omega_value}")
+
+
+
+            # 如果该元素不为零，则记录结果
+                if omega_value != 0:
+                    result_entry = {
+                        'date': target_date,
+                        'cov_matrix': cov_matrix,  # 使用cov_matrix
+                        'omega_value': omega_value,
+                        'P_matrix': P_matrix,
+                        'P_matrix_one': P_matrix_one,
+                        'Q_vector': Q_vector,
+                        'Q_vector_one':Q_vector_one,
+                        'portfolio_vector_before': portfolio_vector_before,
+                        'date_index': date_index  # 记录日期在列表中的索引位置
+                    }
+                    nonzero_results.append(result_entry)
+            else:
+                print(f"警告: 日期索引{date_index}超出Ω矩阵维度{Omega_matrix.shape}")
+
+except Exception as e:
+    print(f"处理过程中发生错误: {e}")
+
+def calculate_bl_posterior(result_entry, tau=0.1):
+    """
+    根据Black-Litterman公式计算后验分布
+    """
+    try:
+        # 提取数据
+        Sigma = np.array(result_entry['cov_matrix'])  # Σ
+        P = np.array(result_entry['P_matrix_one'])  # P
+        Q = np.array(result_entry['Q_vector_one'])  # Q
+        Pi = np.array(result_entry['portfolio_vector_before'])  # Π (先验收益)
+        omega_value = result_entry['omega_value']  # Ω的对角线值
+        Pi = Pi.reshape(-1, 1)
+        Q = Q.reshape(-1, 1)
+        print(f"矩阵维度 - Σ: {Sigma.shape}, P: {P.shape}, Q: {Q.shape}, Π: {Pi.shape}")
+        regularization = 1e-6 * np.eye(Sigma.shape[0])
+        Sigma = Sigma + regularization
+
+        # 2. 检查并处理Ω矩阵
+        if omega_value <= 0:
+            omega_value = 1e-4  # 设置最小正值
+            print(f"调整omega_value为: {omega_value}")
+        n_views = P.shape[0]
+        Omega = np.eye(n_views) * omega_value
+        # Q = np.eye(n_views) * Q
+
+
+        # 计算逆矩阵
+        Sigma_inv = np.linalg.inv(Sigma)
+        Omega_inv = np.linalg.inv(Omega)
+
+        # 计算后验协方差矩阵 Σ_p
+        term1 = tau * Sigma_inv
+        term2 = P.T @ Omega_inv @ P
+        posterior_cov = np.linalg.inv(term1 + term2)
+
+        # 计算后验预期收益 μ̃
+        term3 = tau * Sigma_inv @ Pi
+        term4 = P.T @ Omega_inv @ Q
+        posterior_mean = posterior_cov @ (term3 + term4)
+
+        print("后验计算成功")
+        return posterior_mean, posterior_cov
+
+    except Exception as e:
+        print(f"后验计算失败: {e}")
+        return None, None
+
+
+# 计算所有结果的后验分布
+try:
+    posterior_results = []
+
+    for i, result in enumerate(nonzero_results):
+        print(f"\n=== 计算第 {i + 1} 个日期的后验分布: {result['date'].date()} ===")
+
+        posterior_mean, posterior_cov = calculate_bl_posterior(result)
+
+        if posterior_mean is not None:
+            # 添加到结果中
+            result.update({
+                'posterior_mean': posterior_mean,
+                'posterior_cov': posterior_cov
+            })
+            posterior_results.append(result)
+            print(f"✓ 日期 {result['date'].date()} 的后验计算完成")
+
+    print(f"\n=== 后验计算汇总 ===")
+    print(f"成功计算: {len(posterior_results)} 个日期")
+
+except Exception as e:
+    print(f"处理过程中发生错误: {e}")
+
+# --- 必须确保在文件开头导入了 pandas 和 numpy ---
+# # 输出到Excel (简化版)
+# --- 必须确保在文件开头导入了 pandas 和 numpy ---
+# # 输出到Excel (简化版)
+def save_posterior_to_excel_simple(posterior_results, filename='bl_posterior_results_simple.xlsx'):
+    if not posterior_results:
+        print("没有可保存的后验结果。")
+        return False
+    global stock_codes_raw
+
+    try:
+        # 强制使用 xlsxwriter 引擎 (已根据你之前的修改保留)
+        with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
+            for result in posterior_results:
+                date_str = result['date'].strftime('%Y-%m-%d')
+
+                # 扁平化数据以确保正确创建 DataFrame
+                prior_returns = np.array(result['portfolio_vector_before']).flatten()
+                posterior_returns = np.array(result['posterior_mean']).flatten()
+                N = len(posterior_returns)  # 使用扁平化后的长度
+
+                # 获取对应于当前资产数量 N 的股票名称列表
+                # 假设 stock_codes_raw 包含了所有股票名称，且顺序对应于计算结果
+                asset_names = stock_codes_raw[:N]
+
+                # 先验vs后验收益比较
+                comparison_df = pd.DataFrame({
+                    # ***修改点：将 'Asset_Index' 替换为 'Asset_Code' 并使用股票名称列表***
+                    'Asset_Code': asset_names,
+                    'Prior_Returns': prior_returns,
+                    'Posterior_Returns': posterior_returns,
+                    'Difference': posterior_returns - prior_returns
+                })
+
+                # ***修改点：如果你想让股票代码作为索引，可以这样做：***
+                # comparison_df = pd.DataFrame({
+                #     'Prior_Returns': prior_returns,
+                #     'Posterior_Returns': posterior_returns,
+                #     'Difference': posterior_returns - prior_returns
+                # }, index=asset_names)
+                # comparison_df.to_excel(writer, sheet_name=f'{date_str}_Returns', index=True) # index=True
+
+                comparison_df.to_excel(writer, sheet_name=f'{date_str}_Returns', index=False)
+
+                # 后验协方差矩阵
+                posterior_cov = np.array(result['posterior_cov'])
+                if posterior_cov.dtype == object:
+                    posterior_cov = np.array([[float(x) for x in row] for row in posterior_cov])
+
+                posterior_cov_df = pd.DataFrame(posterior_cov)
+                # 更好的做法是给协方差矩阵加上股票代码作为行索引和列名
+                posterior_cov_df.index = asset_names
+                posterior_cov_df.columns = asset_names
+                posterior_cov_df.to_excel(writer, sheet_name=f'{date_str}_posterior_Covariance', index=True)  # 协方差矩阵通常保留索引
+
+                # P矩阵和Q向量 (已修复 Q 向量未定义变量的问题)
+                P_df = pd.DataFrame(result['P_matrix_one'])
+
+                # 确保 Q 向量是一维数组并加上列名
+                Q_vector_data = np.array(result['Q_vector_one']).flatten()
+                Q_df = pd.DataFrame({'Q_Vector': Q_vector_data})
+
+                P_df.to_excel(writer, sheet_name=f'{date_str}_P_Matrix', index=False)
+                Q_df.to_excel(writer, sheet_name=f'{date_str}_Q_Vector', index=False)
+
+            # 3. 所有后验/先验收益的合并视图
+            all_posterior_data = {}
+            all_prior_data = {}
+
+            for result in posterior_results:
+                date_str = result['date'].strftime('%Y-%m-%d')
+                # 在这里也确保数据是扁平的
+                all_posterior_data[date_str] = np.array(result['posterior_mean']).flatten()
+                all_prior_data[date_str] = np.array(result['portfolio_vector_before']).flatten()
+
+            # 确保所有向量长度一致
+            max_length = max(len(mean) for mean in all_posterior_data.values())
+
+            for data_dict in [all_posterior_data, all_prior_data]:
+                for date_str, mean_vector in data_dict.items():
+                    if len(mean_vector) < max_length:
+                        data_dict[date_str] = np.pad(mean_vector,
+                                                     (0, max_length - len(mean_vector)),
+                                                     constant_values=np.nan)
+
+            # 确定合并视图的索引 (使用最大长度对应的股票代码)
+            max_asset_names = stock_codes_raw[:max_length]
+
+            all_posterior_df = pd.DataFrame(all_posterior_data)
+            all_prior_df = pd.DataFrame(all_prior_data)
+
+            # ***修改点：设置合并视图的索引***
+            all_posterior_df.index = max_asset_names
+            all_prior_df.index = max_asset_names
+
+            all_posterior_df.to_excel(writer, sheet_name='All_Posterior_Returns', index=True)  # index=True
+            all_prior_df.to_excel(writer, sheet_name='All_Prior_Returns', index=True)  # index=True
+
+        print(f"后验结果已保存到: {filename}")
+        return True
+
+    except Exception as e:
+        print(f"保存Excel时发生错误: {e}")
+        return False
+
+
+# 执行保存
+if posterior_results:
+    success = save_posterior_to_excel_simple(posterior_results)
+    if success:
+        print("🎉 Excel文件生成完成！")
+else:
+    print("没有可保存的后验结果")
