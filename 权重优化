@@ -1,0 +1,207 @@
+import pandas as pd
+import numpy as np
+import cvxpy as cp
+from scipy.stats import zscore
+import re
+
+excel_file = pd.ExcelFile(r"C:\Users\cufet\Desktop\副本后验均值和协方差.xlsx")
+print("Excel文件中所有工作表名称:")
+for i, sheet_name in enumerate(excel_file.sheet_names, 1):
+    print(f"{i}. {sheet_name}")
+# --- 0. 参数设置 ---
+# 风险厌恶系数 lambda。请根据您的投资偏好设置。
+lambda_value = 2 ###这个直接采用美国市场的水平
+
+# 选择进行优化的期数。根据您的文件内容，我们选择 '2022-12-12'。
+DATE_COLS = ['2022-12-12', '2023-06-12', '2023-12-11', '2024-06-17', '2024-12-16', '2025-06-16']
+
+# 存储每次优化的权重结果
+all_optimal_weights = {}
+w_before = None  # 初始化上期权重
+
+# --- 1. 数据读取与准备 ---
+
+# --- 1. 数据读取与准备 ---
+for DATE_COL in DATE_COLS:
+    print(f"\n=== 正在处理日期: {DATE_COL} ===")
+
+    try:
+        # 1.1 读取后验均值 (mu)
+        df_mu = pd.read_excel(r"C:\Users\cufet\Desktop\副本后验均值和协方差.xlsx", sheet_name="后验均值",
+                              index_col='股票代码')
+        mu = df_mu[DATE_COL].values  # 特定日期的均值
+        N = len(mu)  # 股票数量
+        print(f"成功读取均值数据，资产数量 N: {N}")
+        target_sheet = f"{DATE_COL}-cov"
+        print(f"读取工作表: {target_sheet}")
+
+        # 1.2 读取后验协方差矩阵
+        df_Sigma = pd.read_excel(r"C:\Users\cufet\Desktop\副本后验均值和协方差.xlsx",
+                                 sheet_name=target_sheet, index_col=0)
+        print(f"成功读取协方差矩阵")
+
+        # 确保协方差矩阵与均值向量的资产列表对齐
+        asset_list = df_mu.index.tolist()
+        df_Sigma_aligned = df_Sigma.loc[asset_list, asset_list]
+        Sigma = df_Sigma_aligned.values
+
+        eigvals, eigvecs = np.linalg.eigh(Sigma)
+        eigvals = np.maximum(eigvals, 1e-8)
+        Sigma = eigvecs @ np.diag(eigvals) @ eigvecs.T
+        # === 新增：使用 psd_wrap 避免特征值验证 ===
+        Sigma = cp.psd_wrap(Sigma)
+        # regularization = 1e-5 * np.eye(N)
+        # Sigma = Sigma + regularization
+
+        if Sigma.shape != (N, N):
+            raise ValueError(f"协方差矩阵维度 {Sigma.shape} 与均值向量 N={N} 不匹配。")
+
+        # 1.3 读取基准权重 (w0)
+        df_w0 = pd.read_excel(r"C:\Users\cufet\Desktop\副本后验均值和协方差.xlsx", sheet_name="基准权重",
+                              index_col='股票代码')
+        w0 = df_w0[DATE_COL].values
+        if len(w0) != N:
+            raise ValueError("基准权重 w0 的数量与均值 mu 的数量不匹配。")
+
+        df_market_cap = pd.read_excel(r"C:\Users\cufet\Desktop\副本后验均值和协方差.xlsx", sheet_name="市值",
+                                      index_col='股票代码')
+        market_cap = df_market_cap[DATE_COL].values
+
+        # 检查维度匹配
+        if len(market_cap) != N:
+            raise ValueError("市值的数量与均值 mu 的数量不匹配。")
+
+    except Exception as e:
+        print(f"数据读取或对齐过程中发生错误: {e}")
+        continue
+
+    StdMarketCap = zscore(market_cap)
+
+    # --- 2. 优化问题求解 ---
+
+    # 2.1 定义优化变量 w (待求的权重向量)
+    w = cp.Variable(N)
+
+    # 如果是第一次优化，使用基准权重作为上期权重；否则使用上一次优化的结果
+    if w_before is None:
+        w_before = w0
+    # 否则 w_before 保持为上一次优化的结果
+
+    # 2.2 定义目标函数
+    alpha_1 = 1e-10
+    alpha_2 = 1e-10
+    alpha_3 = 1e-10
+
+    objective = cp.Minimize(
+        -w @ mu +
+        lambda_value * cp.quad_form(w, Sigma) +
+        alpha_1 * cp.norm(w - w0, 1) +  # L1 正则化（交易成本）
+        alpha_2 * cp.norm(w - w_before, 1) +  # L1 正则化（与上期权重差异）
+        alpha_3 * cp.quad_form(w - w_before, np.eye(N))  # L2 正则化（平滑性）
+    )
+
+    # 2.3 定义约束条件
+    c_sum_to_one = cp.sum(w) == 1
+    c_non_negative = w >= 0
+    diff_w_w0 = w - w0
+    market_cap_constraint_term = cp.multiply(diff_w_w0, StdMarketCap)
+    c_market_cap_upper = market_cap_constraint_term <= 0.2
+    c_market_cap_lower = market_cap_constraint_term >= -0.2
+    w_max = 0.01  # 例如，设置单只股票最大权重为 1%
+    c_weight_limit = w <= w_max * np.ones(N)  # w <= [0.05, 0.05, ..., 0.05]
+
+    constraints = [
+        c_sum_to_one,
+        c_non_negative,
+        c_market_cap_upper,
+        c_market_cap_lower,
+        c_weight_limit
+    ]
+
+    # 2.4 求解问题
+    # problem = cp.Problem(objective, constraints)
+    # problem.solve(solver=cp.OSQP)
+    # problem.solve(solver=cp.OSQP, verbose=False, eps_abs=1e-6, eps_rel=1e-6, max_iter=20000)
+    # 2.4 求解问题 - 正确的多求解器版本
+    problem = cp.Problem(objective, constraints)
+
+    # 定义求解器列表
+    solver_configs = [
+        {"solver": cp.OSQP, "name": "OSQP", "settings": {"eps_abs": 1e-8, "eps_rel": 1e-8, "max_iter": 50000}},
+        {"solver": cp.ECOS, "name": "ECOS", "settings": {"max_iters": 500}},
+        {"solver": cp.SCS, "name": "SCS", "settings": {"max_iters": 10000, "eps": 1e-6}}
+    ]
+
+    solved = False
+    for config in solver_configs:
+        try:
+            print(f"尝试使用 {config['name']} 求解器...")
+            problem.solve(solver=config["solver"], **config["settings"])
+
+            if problem.status in ["optimal", "optimal_inaccurate"]:
+                solved = True
+                print(f"使用 {config['name']} 求解成功，状态: {problem.status}")
+                break
+            else:
+                print(f"使用 {config['name']} 求解失败，状态: {problem.status}")
+
+        except Exception as e:
+            print(f"使用 {config['name']} 求解出错: {e}")
+            continue
+
+    if not solved:
+        # 如果都不行，使用默认设置再试一次
+        print("所有求解器都失败，使用默认OSQP设置...")
+        problem.solve(solver=cp.OSQP)
+
+    # --- 3. 结果输出 ---
+    print(f"\n--- {DATE_COL} 优化结果 ---")
+    if problem.status in ["optimal", "optimal_inaccurate"]:
+        print(f"优化状态: {problem.status}")
+
+        min_value = problem.value
+        print(f"最小化目标函数值: {min_value:.6f}")
+
+        original_objective_value = -min_value
+        print(f"原问题最优值: {original_objective_value:.6f}")
+
+        optimal_weights = w.value
+
+        # 存储当前优化的权重
+        all_optimal_weights[DATE_COL] = optimal_weights
+
+        # 更新 w_before 为当前优化的结果，用于下一次优化
+        w_before = optimal_weights.copy()
+
+        # 检查约束满足情况
+        print(f"检查：优化后权重之和: {np.sum(optimal_weights):.6f}")
+
+        # 检查市值中性约束的偏差范围
+        actual_cap_deviations = (optimal_weights - w0) * StdMarketCap
+        print(
+            f"市值中性约束实际偏差范围 (Min/Max): {np.min(actual_cap_deviations):.6f} / {np.max(actual_cap_deviations):.6f}")
+
+    else:
+        print(f"优化失败，状态: {problem.status}")
+        if problem.status == 'infeasible':
+            print("提示：模型可能无可行解，请检查约束条件是否过于严格。")
+        # 如果优化失败，保持上期权重不变
+        all_optimal_weights[DATE_COL] = w_before.copy()
+
+# --- 4. 输出结果到Excel ---
+if all_optimal_weights:
+    # 创建DataFrame
+    weights_df = pd.DataFrame(all_optimal_weights, index=asset_list)
+
+    # 输出到Excel文件
+    output_file = r"C:\Users\cufet\Desktop\优化权重结果.xlsx"
+    weights_df.to_excel(output_file)
+    print(f"\n所有优化权重已保存到: {output_file}")
+
+    # 打印汇总信息
+    print(f"\n=== 优化完成汇总 ===")
+    print(f"处理了 {len(DATE_COLS)} 个日期")
+    print(f"生成的权重矩阵形状: {weights_df.shape}")
+    print(f"权重数据已保存到Excel文件")
+else:
+    print("没有成功的优化结果可输出")
