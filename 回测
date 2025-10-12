@@ -1,0 +1,531 @@
+import pandas as pd
+import numpy as np
+import os
+import matplotlib
+
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import warnings
+from datetime import timedelta
+
+# --- 辅助设置 ---
+warnings.filterwarnings('ignore')
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+class SimplePortfolioBacktester:
+    # 增加 hs300_data_file 参数
+    def __init__(self, data_path, stock_data_file, csi_data_file, hs300_data_file):
+        self.data_path = data_path
+        self.stock_data_file = stock_data_file
+        self.csi_data_file = csi_data_file
+        self.hs300_data_file = hs300_data_file  # 新增沪深300文件
+
+        self.price_data = None
+        self.custom_matrix = None
+        self.csi500_returns = None
+        self.hs300_returns = None  # 沪深300收益率
+
+        # 交易成本设置
+        self.initial_capital = 10000000  # 初始资金10亿
+        self.buy_fee = 0.0003  # 买入费率 0.03% (万3)
+        self.sell_fee = 0.0013  # 卖出费率 0.05% (万5)
+
+        self._load_all_data()
+
+    def _load_all_data(self):
+        """加载所有数据：股票价格、自定义组合矩阵、中证500指数、沪深300指数。"""
+
+        # 1. 加载股票收盘价 (原有逻辑不变)
+        try:
+            file_path = os.path.join(self.data_path, self.stock_data_file)
+            df = pd.read_excel(file_path, sheet_name='全部数据', header=0)
+            df = df.iloc[1:].set_index(df.columns[0])
+            df.index = pd.to_datetime(df.index)
+            df.columns = df.columns.astype(str)
+            self.price_data = df.apply(pd.to_numeric, errors='coerce').ffill()
+            print(f"股票价格数据形状: {self.price_data.shape}")
+        except Exception as e:
+            print(f"加载股票价格数据失败: {e}")
+            self.price_data = pd.DataFrame()
+
+        # 2. 加载自定义组合状态矩阵 (原有逻辑不变)
+        try:
+            file_path = os.path.join(self.data_path, self.stock_data_file)
+            df = pd.read_excel(file_path, sheet_name='Sheet2', header=0)
+            index_col_name = df.columns[0]
+            self.custom_matrix = df.set_index(index_col_name)
+            self.custom_matrix.index = self.custom_matrix.index.astype(str)
+            print(f"自定义组合矩阵形状: {self.custom_matrix.shape}")
+        except Exception as e:
+            print(f"加载自定义组合矩阵失败: {e}")
+            self.custom_matrix = pd.DataFrame()
+
+        # 3. 加载中证500指数数据 (原有逻辑不变)
+        try:
+            file_path = os.path.join(self.data_path, self.csi_data_file)
+            df = pd.read_excel(file_path, sheet_name='中证500', header=0)
+            df.rename(columns={'交易日期': 'Date', '收盘价': 'Close'}, inplace=True)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+            df = df.sort_index().dropna(subset=['Close'])
+            self.csi500_returns = df['Close'].pct_change().dropna()
+            print(f"中证500指数数据形状: {self.csi500_returns.shape} (按收盘价计算收益率)")
+        except Exception as e:
+            print(f"加载中证500指数数据失败: {e}")
+            self.csi500_returns = pd.Series()
+
+        # 4. 加载沪深300指数数据 (新增逻辑)
+        try:
+            file_path = os.path.join(self.data_path, self.hs300_data_file)
+            # 假设沪深300数据只有两列：交易日期和收盘价 (如图片所示，不需指定Sheet名)
+            df = pd.read_excel(file_path, header=0)
+            df.rename(columns={df.columns[0]: 'Date', df.columns[1]: 'Close'}, inplace=True)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+            df = df.sort_index().dropna(subset=['Close'])
+            self.hs300_returns = df['Close'].pct_change().dropna()
+            print(f"沪深300指数数据形状: {self.hs300_returns.shape} (按收盘价计算收益率)")
+        except Exception as e:
+            print(f"加载沪深300指数数据失败: {e}")
+            self.hs300_returns = pd.Series()
+
+    # (get_custom_weights_by_date 方法不变)
+    def get_custom_weights_by_date(self, rebalance_date):
+        # ... (原有代码不变)
+        if self.custom_matrix is None: return {}
+        rebalance_date = pd.to_datetime(rebalance_date)
+        col_dates = {pd.to_datetime(col, errors='coerce'): col for col in self.custom_matrix.columns}
+        prev_adj_date = max([d for d in col_dates.keys() if not pd.isna(d) and d <= rebalance_date], default=None)
+        if prev_adj_date:
+            target_col_name = col_dates[prev_adj_date]
+        else:
+            return {}
+        selected_stocks_raw = self.custom_matrix[self.custom_matrix[target_col_name] == 1].index.tolist()
+        available_stocks = [
+            s for s in selected_stocks_raw
+            if s in self.price_data.columns
+        ]
+        if not available_stocks:
+            return {}
+        n = len(available_stocks)
+        weight = 1.0 / n
+        new_weights = {s: weight for s in available_stocks}
+        return new_weights
+
+    def run_backtest(self, start_date='2022-12-11', end_date='2025-07-30'):
+        """执行回测并返回结果DataFrame，采用增量调仓逻辑，并计算沪深300净值。"""
+        # 检查数据完整性，新增检查 hs300_returns
+        if self.price_data.empty or self.custom_matrix.empty or self.csi500_returns.empty or self.hs300_returns.empty:
+            print("数据不完整，无法进行回测。")
+            return None
+
+        # --- 确定回测周期和调仓日 ---
+        rebalance_dates = [
+            pd.to_datetime(col, errors='coerce')
+            for col in self.custom_matrix.columns
+            if pd.to_datetime(col, errors='coerce', dayfirst=False) is not pd.NaT
+        ]
+        rebalance_dates.sort()
+
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        # 获取回测区间内的所有交易日 (使用所有基准和价格数据的交集)
+        all_trading_dates = self.price_data.index.intersection(self.csi500_returns.index).intersection(
+            self.hs300_returns.index)
+        all_trading_dates = all_trading_dates[
+            (all_trading_dates >= start_dt) &
+            (all_trading_dates <= end_dt)
+            ]
+
+        if all_trading_dates.empty:
+            print("回测区间内无交易日数据。")
+            return None
+
+        first_trading_date = all_trading_dates[0]
+        future_rebalance_dates = [d for d in rebalance_dates if d > first_trading_date and d <= end_dt]
+
+        # --- 初始化 ---
+        strategy_name = '多因子策略'
+        current_shares = {}
+        cash = self.initial_capital
+        cumulative_returns = pd.Series(index=all_trading_dates, dtype=float)
+        csi500_value = self.initial_capital
+        csi500_values = pd.Series(index=all_trading_dates, dtype=float)
+
+        # 新增沪深300净值初始化
+        hs300_value = self.initial_capital
+        hs300_values = pd.Series(index=all_trading_dates, dtype=float)
+
+        print(f"--- 回测开始，初始资金: {self.initial_capital / 10000:.0f} 万元 ---")
+
+        # ... (初始建仓逻辑不变) ...
+        # ==========================================================
+        # --- 强制在第一个交易日进行初始化建仓 ---
+        # ==========================================================
+        initial_weights = self.get_custom_weights_by_date(first_trading_date)
+        try:
+            initial_prices = self.price_data.loc[first_trading_date].to_dict()
+            can_initial_trade = True
+        except KeyError:
+            print(
+                f"警告：第一个交易日 {first_trading_date.strftime('%Y-%m-%d')} 价格数据缺失，初始建仓失败。策略空仓开始。")
+            can_initial_trade = False
+
+        initial_buy_fee = 0
+        if can_initial_trade and initial_weights:
+            buy_value_total = 0
+            new_shares_to_buy = {}
+            current_portfolio_value = cash
+            for stock, weight in initial_weights.items():
+                price = initial_prices.get(stock, 0)
+                if price > 0 and weight > 0:
+                    target_value = current_portfolio_value * weight
+                    target_shares = int((target_value / price) // 100) * 100
+                    if target_shares > 0:
+                        cost = target_shares * price
+                        new_shares_to_buy[stock] = (target_shares, cost)
+                        buy_value_total += cost
+            if buy_value_total > 0 and buy_value_total <= cash:
+                for stock, (shares, cost) in new_shares_to_buy.items():
+                    fee = cost * self.buy_fee
+                    initial_buy_fee += fee
+                    current_shares[stock] = shares
+                cash -= buy_value_total
+                cash -= initial_buy_fee
+                print(
+                    f"**初始建仓日** {first_trading_date.strftime('%Y-%m-%d')} - 股票数: {len(current_shares)}, 费用: {initial_buy_fee:.2f}, 剩余现金: {cash:.2f}")
+
+        # ==========================================================
+        # --- 每日循环回测 ---
+        # ==========================================================
+
+        for i, date in enumerate(all_trading_dates):
+            if i > 0:
+                # 假设年化无风险利率为 1.5%，按 365 天计息
+                daily_interest_rate = 0.015 / 365
+                cash += cash * daily_interest_rate
+
+            # --- 步骤 1：处理 i=0 的初始净值记录 ---
+            if i == 0:
+                cumulative_returns.loc[date] = self.initial_capital
+                csi500_values.loc[date] = self.initial_capital
+                hs300_values.loc[date] = self.initial_capital  # 沪深300初始值
+                if len(current_shares) == 0:
+                    portfolio_value = self.initial_capital
+                else:
+                    pass
+
+            # --- 步骤 2：增量调仓逻辑 (逻辑不变) ---
+            if date in future_rebalance_dates:
+                sell_fee_total = 0
+                buy_fee_total = 0
+                try:
+                    current_prices = self.price_data.loc[date].to_dict()
+                except KeyError:
+                    print(f"警告：调仓日 {date.strftime('%Y-%m-%d')} 价格数据缺失，跳过调仓。")
+                    continue
+                new_weights = self.get_custom_weights_by_date(date)
+                current_market_value = sum(current_shares.get(stock, 0) * current_prices.get(stock, 0)
+                                           for stock in current_shares.keys())
+                current_portfolio_value = current_market_value + cash
+                target_market_value = current_portfolio_value if new_weights else 0
+                target_shares = {}
+                stock_list_all = set(current_shares.keys()) | set(new_weights.keys())
+                stock_diff = {}
+                for stock in stock_list_all:
+                    weight = new_weights.get(stock, 0)
+                    price = current_prices.get(stock, 0)
+                    current_s = current_shares.get(stock, 0)
+                    if price > 0:
+                        target_val = target_market_value * weight
+                        target_s = int((target_val / price) // 100) * 100
+                        diff = target_s - current_s
+                        stock_diff[stock] = diff
+                        target_shares[stock] = target_s
+                sell_value_total = 0
+                for stock, diff in stock_diff.items():
+                    if diff < 0:
+                        shares_to_sell = abs(diff)
+                        price = current_prices.get(stock)
+                        value = shares_to_sell * price
+                        fee = value * self.sell_fee
+                        sell_fee_total += fee
+                        sell_value_total += value
+                        current_shares[stock] = target_shares[stock]
+                cash += (sell_value_total - sell_fee_total)
+                buy_value_pending = 0
+                buy_list = {}
+                for stock, diff in stock_diff.items():
+                    if diff > 0:
+                        shares_to_buy = diff
+                        price = current_prices.get(stock)
+                        cost = shares_to_buy * price
+                        buy_value_pending += cost
+                        buy_list[stock] = (shares_to_buy, cost)
+                if buy_value_pending > 0 and buy_value_pending <= cash:
+                    for stock, (shares, cost) in buy_list.items():
+                        fee = cost * self.buy_fee
+                        buy_fee_total += fee
+                        current_shares[stock] = target_shares[stock]
+                    cash -= buy_value_pending
+                    cash -= buy_fee_total
+                    print(
+                        f"调仓日 {date.strftime('%Y-%m-%d')} - 卖出费: {sell_fee_total:.2f}, 买入费: {buy_fee_total:.2f}, 调仓股票数: {len(current_shares)}, 剩余现金: {cash:.2f}")
+                elif buy_value_pending > cash:
+                    print(
+                        f"警告：调仓日 {date.strftime('%Y-%m-%d')} 购买现金不足 ({buy_value_pending:.2f} > {cash:.2f})，放弃本次买入。")
+                    for stock, diff in stock_diff.items():
+                        if diff < 0:
+                            pass
+
+            # --- 步骤 3：每日净值更新 (新增沪深300更新) ---
+
+            yesterday = all_trading_dates[i - 1] if i > 0 else date
+            stock_market_value = 0
+
+            if current_shares:
+                portfolio_stocks = list(current_shares.keys())
+                try:
+                    today_prices = self.price_data.loc[date, portfolio_stocks].to_dict()
+                except KeyError:
+                    if i > 0:
+                        portfolio_value = cumulative_returns.loc[yesterday]
+                        cumulative_returns.loc[date] = portfolio_value
+                        csi500_values.loc[date] = csi500_values.loc[yesterday]
+                        hs300_values.loc[date] = hs300_values.loc[yesterday]  # 保持不变
+                        continue
+                    else:
+                        portfolio_value = self.initial_capital
+
+                for stock, shares in current_shares.items():
+                    price = today_prices.get(stock, np.nan)
+                    if not pd.isna(price) and price > 0:
+                        stock_market_value += shares * price
+
+            portfolio_value = stock_market_value + cash
+
+            # 基准净值更新
+            daily_csi_return = self.csi500_returns.get(date, 0.0)
+            daily_hs300_return = self.hs300_returns.get(date, 0.0)  # 新增沪深300收益率
+
+            if i > 0:
+                csi500_value *= (1 + daily_csi_return)
+                hs300_value *= (1 + daily_hs300_return)  # 沪深300净值更新
+
+            # --- 步骤 4：记录净值 ---
+            if i > 0 or (i == 0 and len(current_shares) > 0):
+                cumulative_returns.loc[date] = portfolio_value
+                csi500_values.loc[date] = csi500_value
+                hs300_values.loc[date] = hs300_value  # 记录沪深300净值
+
+        # 将净值数据合并，并计算每日收益率
+        cumulative_value_df = pd.DataFrame({
+            strategy_name: cumulative_returns,
+            'CSI500_Benchmark_Value': csi500_values,
+            'HS300_Benchmark_Value': hs300_values  # 新增沪深300净值
+        }).dropna()
+
+        # 将累计价值转换为每日收益率 (用于指标计算)
+        daily_returns_df = cumulative_value_df.pct_change().dropna()
+
+        # 执行绩效指标计算
+        self.calculate_metrics(daily_returns_df)
+
+        # 季度收益率统计 (保持原有逻辑，只是数据源多了沪深300)
+        quarterly_value_df = cumulative_value_df.resample('Q').ffill().dropna()
+        quarterly_returns_df = quarterly_value_df.pct_change().dropna()
+
+        quarterly_returns_df.rename(columns={
+            strategy_name: f'{strategy_name}_季度收益率(%)',
+            'CSI500_Benchmark_Value': 'CSI500_Benchmark_季度收益率(%)',
+            'HS300_Benchmark_Value': 'HS300_Benchmark_季度收益率(%)'  # 新增沪深300季度收益
+        }, inplace=True)
+
+        quarterly_returns_df *= 100  # 转换为百分比
+        print("\n--- 季度收益率统计 ---")
+        print(quarterly_returns_df)
+
+        # 最终返回累计收益率百分比
+        results_df = pd.DataFrame({
+            strategy_name: (cumulative_returns / self.initial_capital - 1) * 100,
+            'CSI500_Benchmark': (csi500_values / self.initial_capital - 1) * 100,
+            'HS300_Benchmark': (hs300_values / self.initial_capital - 1) * 100  # 新增沪深300累计收益
+        })
+
+        return results_df.dropna()
+
+    def calculate_metrics(self, daily_returns_df):
+        """
+        计算组合总收益、年化收益、夏普比、最大回撤、alpha和beta、跟踪中证500的误差、信息比率。
+        使用沪深300 (HS300) 作为CAPM的市场基准。
+        """
+        if daily_returns_df.empty:
+            print("每日收益率数据为空，无法计算绩效指标。")
+            return
+
+        # 假设无风险日收益率 (R_f)
+        # 年化无风险利率取 1.5%，除以 250 个交易日
+        risk_free_rate_daily = 0.015 / 250
+        trading_days_per_year = 250
+
+        strategy_col = '多因子策略'
+        csi_col = 'CSI500_Benchmark_Value'
+        hs300_col = 'HS300_Benchmark_Value'
+
+        print("\n" + "=" * 50)
+        print("======== 策略绩效指标 (以沪深300为基准) ========")
+        print("=" * 50)
+
+        # 1. 总收益 (Total Return)
+        total_days = len(daily_returns_df)
+        total_return_strategy = (1 + daily_returns_df[strategy_col]).prod() - 1
+        total_return_hs300 = (1 + daily_returns_df[hs300_col]).prod() - 1
+
+        # 2. 年化收益 (Annualized Return)
+        annualized_return_strategy = (1 + total_return_strategy) ** (trading_days_per_year / total_days) - 1
+        annualized_return_hs300 = (1 + total_return_hs300) ** (trading_days_per_year / total_days) - 1
+
+        # 3. 年化波动率 (Annualized Volatility)
+        annualized_volatility_strategy = daily_returns_df[strategy_col].std() * np.sqrt(trading_days_per_year)
+
+        # 4. 夏普比率 (Sharpe Ratio) - 使用年化数据
+        sharpe_ratio = (annualized_return_strategy - (
+                    risk_free_rate_daily * trading_days_per_year)) / annualized_volatility_strategy
+
+        # 5. 最大回撤 (Maximum Drawdown)
+        cumulative_wealth = (1 + daily_returns_df[strategy_col]).cumprod()
+        peak = cumulative_wealth.expanding(min_periods=1).max()
+        drawdown = (cumulative_wealth / peak) - 1
+        max_drawdown = drawdown.min()
+
+        # 6. Beta 和 Alpha (基于CAPM，以沪深300为市场组合)
+        # 计算超额收益
+        strategy_excess_return = daily_returns_df[strategy_col] - risk_free_rate_daily
+        hs300_excess_return = daily_returns_df[hs300_col] - risk_free_rate_daily
+
+        # Beta: 协方差(策略超额, 市场超额) / 方差(市场超额)
+        beta = strategy_excess_return.cov(hs300_excess_return) / hs300_excess_return.var()
+
+        # Alpha: 策略年化超额收益 - Beta * 市场年化超额收益
+        market_annual_excess_return = annualized_return_hs300 - (risk_free_rate_daily * trading_days_per_year)
+        strategy_annual_excess_return = annualized_return_strategy - (risk_free_rate_daily * trading_days_per_year)
+        alpha = strategy_annual_excess_return - beta * market_annual_excess_return
+
+        # 7. 跟踪误差 (Tracking Error) - 跟踪中证500 (CSI500)
+        tracking_difference = daily_returns_df[strategy_col] - daily_returns_df[csi_col]
+        # 年化跟踪误差：差异序列的标准差 * sqrt(交易日)
+        tracking_error = tracking_difference.std() * np.sqrt(trading_days_per_year)
+
+        # 8. 信息比率 (Information Ratio) - 基准为中证500 (CSI500)
+        # 信息比率 = 策略年化超额收益（相对于CSI500）/ 跟踪误差
+        csi_annual_return = (1 + (daily_returns_df[csi_col]).prod()) ** (trading_days_per_year / total_days) - 1
+        annual_excess_vs_csi = annualized_return_strategy - csi_annual_return
+        # 只有跟踪误差不为零时才计算信息比率
+        information_ratio = annual_excess_vs_csi / tracking_error if tracking_error != 0 else np.nan
+
+        # --- 打印结果 ---
+        print(f"年化无风险利率: {risk_free_rate_daily * trading_days_per_year * 100:.2f}%")
+        print("-" * 50)
+        print(f"组合总收益: {total_return_strategy * 100:.2f}%")
+        print(f"沪深300总收益: {total_return_hs300 * 100:.2f}%")
+        print(f"年化收益: {annualized_return_strategy * 100:.2f}%")
+        print(f"年化波动率: {annualized_volatility_strategy * 100:.2f}%")
+        print(f"夏普比率: {sharpe_ratio:.2f}")
+        print(f"最大回撤: {max_drawdown * 100:.2f}%")
+        print("-" * 50)
+        print(">>> 风险指标 (基准: 沪深300) <<<")
+        print(f"Beta (β): {beta:.2f}")
+        print(f"Alpha (α) 年化: {alpha * 100:.2f}%")
+        print("-" * 50)
+        print(">>> 跟踪指标 (基准: 中证500) <<<")
+        print(f"跟踪误差 (TE): {tracking_error * 100:.2f}%")
+        print(f"信息比率 (IR): {information_ratio:.2f}")
+        print("=" * 50)
+
+
+# (plot_performance 函数保持不变)
+def plot_performance(results_df):
+    """绘制投资组合累积收益率图表，新增沪深300。"""
+    if results_df is None or results_df.empty:
+        print("没有可用于绘制的投资组合回测结果。")
+        return
+
+    plt.figure(figsize=(12, 7))
+
+    # 策略颜色和标签映射，新增沪深300
+    strategy_config = {
+        '多因子策略': {'color': 'brown', 'label': '多因子策略', 'linestyle': '-', 'linewidth': 2},
+        'CSI500_Benchmark': {'color': 'black', 'label': '中证500指数 (基准1)', 'linestyle': '--', 'linewidth': 2,
+                             'alpha': 0.7},
+        'HS300_Benchmark': {'color': 'green', 'label': '沪深300指数 (基准2)', 'linestyle': ':', 'linewidth': 2,
+                            'alpha': 0.7}  # 新增
+    }
+
+    for strategy, config in strategy_config.items():
+        if strategy in results_df.columns:
+            data = results_df[strategy]
+            plt.plot(data.index, data.values,
+                     color=config['color'],
+                     label=config['label'],
+                     linestyle=config['linestyle'],
+                     linewidth=config['linewidth'],
+                     alpha=config.get('alpha', 1))
+
+    # 设置图表样式
+    try:
+        title_capital = f"初始资金 {tester.initial_capital / 10000:.0f} 万元"
+    except NameError:
+        title_capital = "初始资金 100 万元"
+
+    plt.title(f'多因子策略 vs. 基准指数 ({title_capital})', fontsize=14, fontweight='bold', pad=15)
+    plt.xlabel('日期', fontsize=10)
+    plt.ylabel('累积收益率 (%)', fontsize=10)
+    plt.legend(fontsize=10, loc='best')
+    plt.grid(False)
+
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+    plt.gcf().autofmt_xdate()
+    plt.axhline(y=0, color='red', linestyle='-', alpha=0.5, linewidth=1)
+    plt.tight_layout()
+    plt.show()
+
+    print("\n各策略最终累积收益率统计：")
+    for strategy, config in strategy_config.items():
+        if strategy in results_df.columns:
+            final_return = results_df[strategy].iloc[-1]
+            print(f"{config['label']}: {final_return:.2f}%")
+
+
+if __name__ == "__main__":
+    # !!! 请根据您的实际文件路径和文件名进行修改 !!!
+    data_path = r"C:\Users\cufet\Desktop\测试集"
+
+    STOCK_DATA_FILE = "优化权重结果.xlsx"
+    CSI500_INDEX_FILE = "中证500指数日收益率.xls"
+    # 新增沪深300数据文件名称 (假设您将其命名为这个)
+    HS300_INDEX_FILE = "沪深300指数收盘价.xls"
+
+    try:
+        # 实例化类，新增沪深300文件路径
+        tester = SimplePortfolioBacktester(data_path, STOCK_DATA_FILE, CSI500_INDEX_FILE, HS300_INDEX_FILE)
+
+        if not tester.price_data.empty and not tester.custom_matrix.empty and not tester.csi500_returns.empty and not tester.hs300_returns.empty:
+            print("--- 开始回测 ---")
+            portfolio_results_df = tester.run_backtest(
+                start_date='2022-12-13',
+                end_date='2025-09-1'
+            )
+
+            if portfolio_results_df is not None:
+                print("--- 结果可视化 ---")
+                plot_performance(portfolio_results_df)
+
+    except Exception as e:
+        print(f"分析过程中出现错误: {e}")
