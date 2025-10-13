@@ -1,0 +1,3734 @@
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')  # 保留您的TkAgg设置
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, List, Optional, Callable
+import warnings
+import os
+from typing import Dict
+from scipy.stats import pearsonr
+from sklearn.linear_model import Lasso
+import joblib # 导入 joblib 用于保存模型
+from sklearn.preprocessing import StandardScaler
+# 配置中文显示和警告过滤
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
+matplotlib.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore')
+
+class CS500FactorAnalyzer:
+
+    def __init__(self, data_folder: str):
+        self.data_folder = Path(data_folder)
+        self.all_data = {}
+        self.factor_results = {}
+        self.synthetic_factors = {}
+
+    def parse_dirty_wide_table(self, raw_data: pd.DataFrame, sheet_name: str = None) -> pd.DataFrame:
+        """
+        解析脏宽表，并根据因子名称应用不同的缺失值/0值填充逻辑。
+        """
+        try:
+            data = raw_data.copy()
+            # 1. 设置列名为股票代码（第1行，索引 0）
+            data.columns = data.iloc[0].values
+            # 2. 删除前两行（代码行和名称行）
+            clean_data = data.iloc[2:].copy()
+            # 3. 设置时间索引（第一列）
+            time_col_name = clean_data.columns[0]
+            clean_data = clean_data.set_index(time_col_name)
+            cleaned_index = [val if not isinstance(val, tuple) else pd.NaT for val in clean_data.index]
+            clean_data.index = pd.Index(cleaned_index)
+            # 4. 解析时间索引并转为数值
+            clean_data.index = pd.to_datetime(clean_data.index)
+            # 确保数据列是数值类型，非数值转为 NaN
+            clean_data = clean_data.apply(pd.to_numeric, errors='coerce')
+
+            # 5. 清理和统一命名 (先删除全为空的列，再进行填充)
+            clean_data = clean_data.dropna(axis=1, how='all')
+
+            # ==================== 0值和缺失值处理逻辑 (新增/修改) ====================
+            target_sheets = ['ROE', '自由现金流', 'EPS', 'EBITDA']
+
+            if sheet_name in target_sheets:
+                # 针对特定 sheets: 0值采用随机模拟填充
+                print(f"   🔧 正在对 {sheet_name} 进行 **随机向前模拟** 填充...")
+
+                # 找出所有 0 值的 mask
+                zero_mask = (clean_data == 0)
+
+                for col in clean_data.columns:
+                    series = clean_data[col]
+                    zero_indices = series[zero_mask[col]].index
+
+                    if not zero_indices.empty:
+                        # 1. 临时将 0 替换为 NaN
+                        temp_series = series.replace(0, np.nan)
+
+                        # 2. 反向填充 (bfill) 得到“后面第一个非零值 V”
+                        # 相当于 series.bfill() 的效果
+                        next_non_zero = temp_series.iloc[::-1].ffill().iloc[::-1]
+
+                        # 3. 提取对应于 0 索引的 V 值
+                        next_non_zero_for_zeros = next_non_zero.loc[zero_indices]
+
+                        # 4. 生成均匀随机数 U(0, 1)
+                        random_uniform = np.random.rand(len(zero_indices))
+
+                        # 5. 模拟值 = V + U(0, 1) - 0.5
+                        simulated_values = next_non_zero_for_zeros + random_uniform - 0.5
+
+                        # 6. 填充回原数据
+                        clean_data.loc[zero_indices, col] = simulated_values
+
+                # 7. 对可能存在的原始 NaN 或序列末尾未被填充的 0 进行标准的前后填充
+                clean_data = clean_data.fillna(method='ffill').fillna(method='bfill')
+
+            else:
+                # 其他 sheets: 0 和 NaN 都采用 ffill/bfill 标准填充
+                # 1. 将 0 视为缺失值 (NaN)，以便统一填充
+                clean_data = clean_data.replace(0, np.nan)
+
+                # 2. ffill 和 bfill 填充
+                # print(f"   🔧 正在对 {sheet_name} 进行 **ffill/bfill** 填充 ...")
+                clean_data = clean_data.fillna(method='ffill').fillna(method='bfill')
+
+
+            # ==================== 0值和缺失值处理逻辑 (结束) ====================
+
+            # 6. 清理和统一命名 (与原有逻辑一致)
+            clean_data.columns.name = 'code'
+            clean_data.index.name = 'date'
+
+            # 调试信息
+            # if sheet_name:
+            #     print(sheet_name)
+            #     print(
+            #         f"✅ 解析完成: {clean_data.shape}, 时间范围: {clean_data.index.min()} 到 {clean_data.index.max()}")
+
+            return clean_data
+
+        except Exception as e:
+            print(f"❌ 解析 {sheet_name} 失败: {e}")
+            raise
+
+    def load_all_periods(self):
+        """加载所有时间点的数据"""
+
+        # 1. 查找所有匹配的文件 (.xlsx 和 .xls)，并按名称排序
+        excel_files = sorted(
+            list(self.data_folder.glob("中证500_*.xlsx")) +
+            list(self.data_folder.glob("中证500_*.xls"))
+        )
+
+        if not excel_files:
+            print(
+                f"⚠️ 未找到本地 Excel 文件。请检查路径：{self.data_folder} 下是否存在命名为 '中证500_*.xlsx' 或 '中证500_*.xls' 的文件。")
+            return
+
+        print(f"找到 {len(excel_files)} 个数据文件")
+
+        for file in excel_files:
+            # 【修改 1：提取周期名称，并去掉 "中证500_" 前缀】
+            period_name = file.stem.replace("中证500_", "")
+            print(f"\n📁 加载: {period_name}")
+
+            try:
+                xl_file = pd.ExcelFile(file)
+                period_data = {}
+
+                for sheet_name in xl_file.sheet_names:
+                    # Sheet1 通常是股票基本信息
+                    if sheet_name == 'Sheet1':
+                        stock_info = pd.read_excel(file, sheet_name=sheet_name)
+                        period_data['stock_info'] = stock_info
+                    else:
+                        # 其他 Sheet 是因子数据，需要脏宽表解析
+                        # 确保传入 header=None，与 parse_dirty_wide_table 匹配
+                        sheet_data = pd.read_excel(file, sheet_name=sheet_name, header=None)
+                        try:
+                            # 调用解析函数。此时，sheet_name 被传入，用于触发 parse_dirty_wide_table 中的随机模拟逻辑
+                            parsed_data = self.parse_dirty_wide_table(sheet_data, sheet_name)
+
+                            # 如果解析后数据为空，则跳过
+                            if parsed_data.empty:
+                                continue
+
+                            period_data[sheet_name] = parsed_data
+
+                        except Exception:
+                            # 捕获解析 Sheet 内部的错误，继续处理下一个 Sheet
+                            continue
+
+                # 【修改 2：使用去掉前缀的 period_name 作为 all_data 的 Key】
+                self.all_data[period_name] = period_data
+
+                # 打印加载成功的因子键
+                loaded_keys = [k for k in period_data.keys() if k != 'stock_info']
+
+                # 【修改 3：在加载完成的输出中，也使用去掉前缀的 period_name】
+                print(f"    ✅ {period_name} 文件加载完成，包含 {len(loaded_keys)} 个因子数据项。Keys: {loaded_keys}")
+
+
+            except Exception as e:
+                print(f"❌ 加载文件 {file.name} 失败: {e}")
+
+        # 显示数据概览
+        if self.all_data:
+            self._display_data_overview()
+        else:
+            print("\n⚠️  没有成功加载任何数据")
+
+
+    def _display_data_overview(self):
+        """显示数据概览"""
+        print(f"\n{'=' * 60}")
+        print("数据加载概览")
+        print(f"{'=' * 60}")
+
+        for period_name, period_data in self.all_data.items():
+            print(f"\n📅 时间段: {period_name}")
+            # for data_name, data in period_data.items():
+            #     if data_name == 'stock_info':
+            #         print(f"   📋 股票信息: {len(data)} 只股票")
+            #     else:
+            #         if hasattr(data, 'shape'):
+            #             print(f"   📊 {data_name}: {data.shape} (时间点×股票)")
+            #             if hasattr(data, 'index'):
+            #                 print(f"     时间范围: {data.index.min()} 到 {data.index.max()}")
+
+    def calculate_synthetic_factor(self, factor_name: str, calculation_func: Callable):
+        """
+        计算合成因子
+        """
+        print(f"\n🔧 计算合成因子: {factor_name}")
+        self.synthetic_factors[factor_name] = {}
+
+        success_count = 0
+        for period_name, period_data in self.all_data.items():
+            try:
+                # 传入 period_data (包含所有时间序列宽表)
+                factor_data = calculation_func(period_data)
+
+                # 检查返回结果是否为每日时间序列宽表
+                if not factor_data.empty and factor_data.index.name == 'date' and factor_data.columns.name == 'code':
+                    self.synthetic_factors[factor_name][period_name] = factor_data
+                    success_count += 1
+                    print(
+                        f"   ✅ {period_name}: 计算成功, 每日截面: {len(factor_data)}, 股票数: {len(factor_data.columns)}")
+                else:
+                    print(f"   ⚠️  {period_name}: 无有效数据或数据格式错误")
+            except Exception as e:
+                print(f"   ❌ {period_name}: 计算失败 - {e}")
+
+        print(f"📈 {factor_name} 计算完成: {success_count}/{len(self.all_data)} 个时间段")
+
+    # ==================== 每日滚动因子计算方法 ====================
+    def calculate_alpha1(self, period_data: Dict) -> pd.DataFrame:
+        if '收盘价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少收盘价或成交量数据")
+
+        close_df = period_data['收盘价']
+        volume_df = period_data['成交量']
+
+        # 1. 确保数据对齐
+        common_stocks = close_df.columns.intersection(volume_df.columns)
+        close_df = close_df[common_stocks]
+        volume_df = volume_df[common_stocks]
+        close_rank_cs = close_df.rank(axis=1, pct=True)  # 每天在所有股票中排名
+        volume_rank_cs = volume_df.rank(axis=1, pct=True)
+
+        # 1b. 计算这两组排名序列在过去10天的**时间序列**相关性 (rolling(10).corr())
+        # 这样计算的是**斯皮尔曼等级相关系数** (Spearman's rank correlation coefficient)
+        # 对每只股票，计算其过去10天的 (close_rank_cs, volume_rank_cs) 的相关性。
+        corr_term_raw = close_rank_cs.rolling(window=10).corr(volume_rank_cs)
+
+        # --- Step 2: rank(correlation_term) * rank(delta_term) ---
+
+        # 2a. 对相关性项进行**截面**排名: rank(corr_term_raw)
+        rank_corr_term = corr_term_raw.rank(axis=1, pct=True)
+
+        # 2b. 滚动计算价格变化项: delta(close, 5)
+        delta_term_raw = close_df.diff(5)
+
+        # 2c. 对价格变化项进行**截面**排名: rank(delta(close, 5))
+        rank_delta_term = delta_term_raw.rank(axis=1, pct=True)
+
+        # 2d. 组合: rank(correlation(...)) * rank(delta(...))
+        raw_factor_df = rank_corr_term * rank_delta_term
+
+        # --- Step 3: 最终因子值 (原始因子值是每日截面值) ---
+        # 对最终结果进行截面排名，这是通常的做法，以确保因子值分布统一
+        alpha1_df = raw_factor_df.rank(axis=1, pct=True, method='average')
+
+        # 清理和统一命名
+        alpha1_df.columns.name = 'code'
+        alpha1_df.index.name = 'date'
+
+        # 删除所有股票都是 NaN 的日期
+        return alpha1_df.dropna(how='all')
+
+    def calculate_alpha2(self, period_data: Dict) -> pd.DataFrame:
+        """
+        Alpha#2 (每日滚动): rank(delta(close, 5)) * rank(delta(volume, 5))
+        """
+        if '收盘价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少收盘价或成交量数据")
+
+        close_df = period_data['收盘价']
+        volume_df = period_data['成交量']
+
+        common_stocks = close_df.columns.intersection(volume_df.columns)
+        close_df = close_df[common_stocks]
+        volume_df = volume_df[common_stocks]
+
+        # 1. 5日价格变化: delta(close, 5)
+        delta_close = close_df.diff(5)
+        # 2. 5日成交量变化: delta(volume, 5)
+        delta_volume = volume_df.diff(5)
+
+        # 3. 截面排名 (Cross-sectional Rank): 这是关键！
+        # rank(delta(close, 5))
+        ranked_delta_close = delta_close.rank(axis=1, pct=True, method='average')
+        # rank(delta(volume, 5))
+        ranked_delta_volume = delta_volume.rank(axis=1, pct=True, method='average')
+
+        # 4. 最终因子值: 两个排名值的乘积
+        alpha2_df = ranked_delta_close * ranked_delta_volume
+
+        alpha2_df.columns.name = 'code'
+        alpha2_df.index.name = 'date'
+
+        # 删除所有股票都是 NaN 的日期
+        return alpha2_df.dropna(how='all')
+
+    def calculate_alpha3(self, period_data: Dict) -> pd.DataFrame:
+        """
+        Alpha#3 (每日滚动): rank(stddev(close, 10)) * rank(delta(volume, 5))
+        这里我们计算：rank(stddev(close, 10)) * rank(delta(volume, 5))
+        """
+        if '收盘价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少收盘价或成交量数据")
+
+        close_df = period_data['收盘价']
+        volume_df = period_data['成交量']
+
+        common_stocks = close_df.columns.intersection(volume_df.columns)
+        close_df = close_df[common_stocks]
+        volume_df = volume_df[common_stocks]
+
+        # 1. 滚动计算10日波动率: stddev(close, 10)
+        volatility_term = close_df.rolling(window=10).std()
+
+        # 2. 滚动计算5日成交量变化: delta(volume, 5)
+        delta_volume_term = volume_df.diff(5)
+
+        # 3. 截面排名: 分别对两个项进行每日截面排名
+        # rank(stddev(close, 10))
+        ranked_volatility = volatility_term.rank(axis=1, pct=True, method='average')
+
+        # rank(delta(volume, 5))
+        ranked_delta_volume = delta_volume_term.rank(axis=1, pct=True, method='average')
+
+        # 4. 最终因子值: 两个排名值的乘积
+        alpha3_df = ranked_volatility * ranked_delta_volume
+
+        alpha3_df.columns.name = 'code'
+        alpha3_df.index.name = 'date'
+
+        return alpha3_df.dropna(how='all')
+
+    def calculate_ROC6(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: ROC6 (6周期价格变化率)
+        公式: (收盘价 / N周期前收盘价 - 1) * 100
+        """
+        if '收盘价' not in period_data:
+            raise ValueError("缺少收盘价数据")
+
+        close_df = period_data['收盘价']
+
+        # 计算 N=6 周期前的收盘价
+        close_lagged = close_df.shift(6)
+
+        # 计算ROC6
+        ROC6_df = ((close_df / close_lagged) - 1) * 100
+
+        # 截面排名 (可选，但通常因子都需要排名或标准化)
+        factor_df = ROC6_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+    def calculate_BIAS60(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: BIAS60 (60周期价格乖离率)
+        公式: (收盘价 - 60周期均价) / 60周期均价 * 100
+        """
+        if '收盘价' not in period_data:
+            raise ValueError("缺少收盘价数据")
+
+        close_df = period_data['收盘价']
+
+        # 计算60周期简单移动平均线 (Simple Moving Average, SMA)
+        MA60 = close_df.rolling(window=60).mean()
+
+        # 计算BIAS60
+        BIAS60_df = ((close_df - MA60) / MA60) * 100
+
+        # 截面排名
+        factor_df = BIAS60_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+    def calculate_CCI20(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: CCI20 (20周期商品通道指数)
+        """
+        if '收盘价' not in period_data or '日最高价' not in period_data or '日最低价' not in period_data:
+            raise ValueError("缺少收盘价、最高价或最低价数据")
+
+        close_df = period_data['收盘价']
+        high_df = period_data['日最高价']
+        low_df = period_data['日最低价']
+        N = 20
+
+        # 1. 计算 Typical Price (TP)
+        TP_df = (high_df + low_df + close_df) / 3
+
+        # 2. 计算 TP 的 N 周期 SMA (SMATP)
+        SMATP_df = TP_df.rolling(window=N).mean()
+
+        # 3. 计算 N 周期平均绝对偏差 (Mean Deviation)
+        # MeanDeviation = SMA(|TP - SMATP|, N)
+        MD_df = (TP_df - SMATP_df).abs().rolling(window=N).mean()
+
+        # 4. 计算 CCI
+        # 避免除以零
+        MD_df_safe = MD_df.replace(0, np.nan)
+        CCI20_df = (TP_df - SMATP_df) / (0.015 * MD_df_safe)
+
+        # 截面排名
+        factor_df = CCI20_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+    def calculate_WVAD6(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: WVAD (6周期加权成交量变异度 - 平滑形式)
+        公式: SMA( ( (Close - Open) / (High - Low) ) * Volume , 6 )
+        """
+        if '收盘价' not in period_data or '开盘价' not in period_data or \
+                '日最高价' not in period_data or '日最低价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少价格或成交量数据")
+
+        close_df = period_data['收盘价']
+        open_df = period_data['开盘价']
+        high_df = period_data['日最高价']
+        low_df = period_data['日最低价']
+        volume_df = period_data['成交量']
+        N = 6
+
+        # 1. 计算核心比率: (Close - Open) / (High - Low)
+        # 避免除以零: 当 High=Low 时，该比率为 NaN (或设为0)
+        price_range = high_df - low_df
+        # 使用 np.divide 安全地执行除法，并用 where 避免除零
+        ratio_df = np.divide(close_df - open_df, price_range,
+                             out=np.zeros_like(price_range, dtype=float),
+                             where=price_range != 0)
+
+        # 2. 计算加权成交量: Ratio * Volume
+        weighted_volume = ratio_df * volume_df
+
+        # 3. 计算 N=6 周期移动平均 (SMA)
+        WVAD_df = weighted_volume.rolling(window=N).mean()
+
+        # 截面排名
+        factor_df = WVAD_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_EP_Factor(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: EP (盈利收益率)
+        公式: 1 / PE，然后进行截面排名。
+        """
+        if 'PE' not in period_data:
+            raise ValueError("缺少PE数据")
+
+        PE_df = period_data['PE']
+
+        # 避免除零和极端值：PE > 0 才有意义
+        EP_df = 1.0 / PE_df.mask(PE_df <= 0)
+
+        # 截面排名 (rank(axis=1))
+        factor_df = EP_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_ROE_Factor(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: ROE (净资产收益率)
+        公式: ROE，然后进行截面排名。
+        """
+        if 'ROE' not in period_data:
+            raise ValueError("缺少ROE数据")
+
+        ROE_df = period_data['ROE']
+
+        # 对ROE进行截面排名
+        factor_df = ROE_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_EPS_Growth_Factor(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: EPS_Growth (250日EPS增长率)
+        公式: (EPS / 250周期前EPS) - 1，然后进行截面排名。
+        """
+        if 'EPS' not in period_data:
+            raise ValueError("缺少EPS数据")
+
+        EPS_df = period_data['EPS']
+
+        # EPS 过去 250 个周期（约一年）前的数值
+        EPS_lagged = EPS_df.shift(30)
+
+        # 计算增长率
+        growth_df = (EPS_df / EPS_lagged) - 1
+
+        # 截面排名
+        factor_df = growth_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_Turnover20_Factor(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: Turnover20 (20日平均换手率)
+        公式: 20日换手率的简单移动平均 (SMA)，然后进行截面排名。
+        """
+        if '换手率' not in period_data:
+            raise ValueError("缺少换手率数据")
+
+        turnover_df = period_data['换手率']
+
+        # 计算20日简单移动平均
+        SMA_turnover = turnover_df.rolling(window=20).mean()
+
+        # 截面排名
+        factor_df = SMA_turnover.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_momentum_value_composite(self, period_data: Dict) -> pd.DataFrame:
+        """
+        动量-价值复合因子
+        公式: rank(ROC20) * rank(1/PE)
+        结合中期动量与价值低估
+        """
+        if '收盘价' not in period_data or 'PE' not in period_data:
+            raise ValueError("缺少收盘价或PE数据")
+
+        close_df = period_data['收盘价']
+        pe_df = period_data['PE']
+
+        # 20日动量
+        roc20 = (close_df / close_df.shift(20) - 1)
+
+        # 价值因子 (盈利收益率)
+        ep = 1.0 / pe_df.mask(pe_df <= 0)
+
+        # 复合因子
+        composite = roc20.rank(axis=1, pct=True) * ep.rank(axis=1, pct=True)
+
+        factor_df = composite.rank(axis=1, pct=True)
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_vol_adjusted_value(self, period_data: Dict) -> pd.DataFrame:
+        """
+        波动率调整价值因子
+        公式: rank(EP) / rank(波动率)
+        在价值因子上考虑风险调整
+        """
+        if 'PE' not in period_data or '收盘价' not in period_data:
+            raise ValueError("缺少PE或收盘价数据")
+
+        pe_df = period_data['PE']
+        close_df = period_data['收盘价']
+
+        # 盈利收益率
+        ep = 1.0 / pe_df.mask(pe_df <= 0)
+
+        # 20日波动率
+        volatility = close_df.pct_change().rolling(20).std()
+
+        # 波动率调整价值
+        vol_adjusted_ep = ep.rank(axis=1, pct=True) / (volatility.rank(axis=1, pct=True) + 1e-6)
+
+        factor_df = vol_adjusted_ep.rank(axis=1, pct=True)
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_volume_price_divergence(self, period_data: Dict) -> pd.DataFrame:
+        """
+        量价背离因子
+        公式: rank(价格动量) - rank(成交量动量)
+        捕捉量价背离的技术信号
+        """
+        if '收盘价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少收盘价或成交量数据")
+
+        close_df = period_data['收盘价']
+        volume_df = period_data['成交量']
+
+        # 5日价格动量
+        price_momentum = close_df.pct_change(5)
+
+        # 5日成交量动量
+        volume_momentum = volume_df.pct_change(5)
+
+        # 量价背离
+        divergence = price_momentum.rank(axis=1, pct=True) - volume_momentum.rank(axis=1, pct=True)
+
+        factor_df = divergence.rank(axis=1, pct=True)
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_profitability_growth(self, period_data: Dict) -> pd.DataFrame:
+        """
+        盈利能力增长因子
+        公式: rank(ROE变化率) * rank(EBITDA增长率)
+        捕捉盈利能力的改善趋势
+        """
+        if 'ROE' not in period_data or 'EBITDA' not in period_data:
+            raise ValueError("缺少ROE或EBITDA数据")
+
+        roe_df = period_data['ROE']
+        ebitda_df = period_data['EBITDA']
+
+        # ROE 60日变化率
+        roe_growth = (roe_df / roe_df.shift(60) - 1)
+
+        # EBITDA 60日增长率
+        ebitda_growth = (ebitda_df / ebitda_df.shift(60) - 1)
+
+        # 复合增长因子
+        growth_factor = roe_growth.rank(axis=1, pct=True) * ebitda_growth.rank(axis=1, pct=True)
+
+        factor_df = growth_factor.rank(axis=1, pct=True)
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def prepare_panel_data(self, factor_name: str) -> pd.DataFrame:
+        """
+        准备面板数据 (统一处理基础因子和每日滚动合成因子)
+        - 将所有时间序列宽表转为长表并合并
+        """
+        panel_data = []
+
+        for period_name, period_data in self.all_data.items():
+            factor_df = None
+
+            # 优先检查合成因子 (现已改为每日滚动计算，返回时间序列宽表)
+            if factor_name in self.synthetic_factors and period_name in self.synthetic_factors[factor_name]:
+                factor_df = self.synthetic_factors[factor_name][period_name]
+            # 其次检查基础因子 (本身就是时间序列宽表)
+            elif factor_name in period_data:
+                factor_df = period_data[factor_name]
+
+            if factor_df is not None and not factor_df.empty:
+                # 使用 stack 将宽表 (Index=date, Columns=code) 转为长表
+                try:
+                    long_factor_df = factor_df.stack().reset_index()
+                    long_factor_df.columns = ['date', 'code', factor_name]
+                    long_factor_df['period'] = period_name
+                    panel_data.append(long_factor_df)
+                except Exception as e:
+                    print(f"⚠️  {period_name} - {factor_name} 数据转换失败: {e}")
+                    continue
+
+        result_df = pd.concat(panel_data, ignore_index=True) if panel_data else pd.DataFrame()
+
+        if not result_df.empty:
+            # 确保日期是 datetime 类型
+            result_df['date'] = pd.to_datetime(result_df['date'])
+            print(f"\n✅ 因子 '{factor_name}' 面板数据:")
+            print(f"   时间点: {result_df['date'].nunique()}")
+            print(f"   股票数: {result_df['code'].nunique()}")
+            print(f"   总记录: {len(result_df)}")
+        else:
+            print(f"\n⚠️  因子 '{factor_name}' 无数据")
+
+        return result_df
+
+    def calculate_returns(self) -> pd.DataFrame:
+        """计算收益率"""
+        returns_data = []
+
+        for period_name, period_data in self.all_data.items():
+            if '收盘价' in period_data:
+                close_df = period_data['收盘价']
+                # 计算日收益率
+                returns_df = close_df.pct_change()
+
+                # 将收益率宽表转为长表
+                long_returns_df = returns_df.stack().reset_index()
+                long_returns_df.columns = ['date', 'code', 'return']
+                returns_data.append(long_returns_df)
+
+        result_df = pd.concat(returns_data, ignore_index=True) if returns_data else pd.DataFrame()
+
+        if not result_df.empty:
+            # 确保日期是 datetime 类型
+            result_df['date'] = pd.to_datetime(result_df['date'])
+            # 清理 Inf/-Inf (除以0可能产生)
+            result_df = result_df.replace([np.inf, -np.inf], np.nan).dropna(subset=['return'])
+            print(f"\n📈 收益率数据: {len(result_df)} 条记录")
+        return result_df
+
+    def analyze_factor(self, factor_name: str, plot: bool = False):
+        """分析单个因子"""
+        print(f"\n{'=' * 60}")
+        print(f"🔍 分析因子: {factor_name}")
+        print(f"{'=' * 60}")
+
+        # 准备因子数据 (已是每日时间序列)
+        factor_df = self.prepare_panel_data(factor_name)
+        if factor_df.empty:
+            print(f"❌ 因子 {factor_name} 无数据")
+            return
+
+        # 准备收益数据
+        returns_df = self.calculate_returns()
+
+        # 合并数据
+        # 统一列名以供下一步分析
+        merged_data = factor_df.merge(returns_df, on=['date', 'code'], how='inner')
+
+        if merged_data.empty:
+            print("❌ 无有效数据用于分析")
+            dates = factor_df['date'].unique()
+            if len(dates) <= 1:
+                print("提示：当前数据集中交易日过少，无法进行 T->T+1 的时间序列分析。")
+            return
+
+        print(f"✅ 合并数据: {len(merged_data)} 条记录")
+        print(f"   时间范围: {merged_data['date'].min()} 到 {merged_data['date'].max()}")
+        print(f"   股票数量: {merged_data['code'].nunique()}")
+
+        # 执行分析
+        results, daily_returns = self._perform_analysis(merged_data, factor_name)
+
+        # 可视化
+        if plot:
+            self._create_plots(results, factor_name, merged_data)
+            if 'long_short_returns' in daily_returns and not daily_returns['long_short_returns'].empty:
+                self._plot_cumulative_return(daily_returns['long_short_returns'], factor_name)
+
+        self.factor_results[factor_name] = results
+        return results
+
+    def _perform_analysis(self, data: pd.DataFrame, factor_name: str) -> tuple[Dict, Dict]:
+        """执行因子分析 (已修复 T->T+1 匹配逻辑, 增加IC自相关性和多空组合收益序列)"""
+        results = {}
+        daily_returns = {}  # 用于存储多空组合每日收益序列
+
+        # IC分析
+        ic_series = []
+        Rankic_series = []
+        # 获取所有唯一的、按升序排列的日期
+        dates = sorted(data['date'].unique())
+
+        # 用于分档分析 (每日多空收益)
+        long_short_daily_returns = []
+
+        # 注意：这里 date[i] 是因子日期 T，date[i+1] 是收益率日期 T+1
+        for i in range(len(dates) - 1):
+            current_date = dates[i]
+            next_date = dates[i + 1]
+
+            # T 日的因子值
+            current_factors = data[data['date'] == current_date][['code', factor_name]].copy()
+            # T+1 日的收益率
+            next_returns = data[data['date'] == next_date][['code', 'return']].copy()
+
+            # 合并 T 日因子和 T+1 日收益
+            merged = current_factors.merge(next_returns, on='code', how='inner')
+
+            if len(merged) > 20:  # 最小股票数量要求 (为分档多空留出余量)
+                # --- RankIC 计算 ---
+                ic = merged[factor_name].corr(merged['return'], method='pearson')
+                Rankic = merged[factor_name].corr(merged['return'], method='spearman')
+                if not np.isnan(ic):
+                    ic_series.append(ic)
+                if not np.isnan(Rankic):
+                    Rankic_series.append(Rankic)
+
+                # --- 分档多空收益计算 ---
+                try:
+                    # T日分档
+                    merged['decile'] = pd.qcut(
+                        merged[factor_name], 5, labels=False, duplicates='drop'
+                    )
+
+                    # 确保分档在 0-9 之间
+                    if merged['decile'].min() == 0 and merged['decile'].max() == 4:
+                        # 最高档 (9) 平均收益 - 最低档 (0) 平均收益
+                        return_4 = merged[merged['decile'] == 4]['return'].mean()
+                        return_0 = merged[merged['decile'] == 0]['return'].mean()
+                        long_short_return = return_4 - return_0
+                        long_short_daily_returns.append(pd.Series(long_short_return, index=[next_date]))
+                except Exception:
+                    # 可能数据不足导致分档失败，跳过这一天
+                    pass
+
+        if ic_series:
+            # IC序列的索引应该对应收益率日期 (T+1 日)
+            ic_series = pd.Series(ic_series, index=dates[1:len(ic_series) + 1])
+            ic_series = ic_series[(ic_series != 0) & (ic_series.notna()) & (ic_series != '')]
+            monthly_ic_mean = ic_series.resample('M').mean()
+            annual_ic_mean = ic_series.resample('Y').mean()
+            Rankic_series = pd.Series(Rankic_series, index=dates[1:len(Rankic_series) + 1])
+            Rankic_series = Rankic_series[(Rankic_series != 0) & (ic_series.notna()) & (Rankic_series != '')]
+            results['ic_series'] = ic_series
+            results['annual_ic_mean'] = annual_ic_mean.mean()
+            results['monthly_ic_mean'] = monthly_ic_mean.mean()
+            results['Rankic_series'] = Rankic_series
+            results['ic_mean'] = ic_series.mean()
+            results['Rankic_mean'] = Rankic_series.mean()
+            results['ic_std'] = ic_series.std()
+            results['ir'] = results['ic_mean'] / results['ic_std'] if results['ic_std'] != 0 else 0
+            results['win_rate'] = (ic_series > 0).mean() if results['ic_mean'] >= 0 else (ic_series < 0).mean()
+            results['factor_direction'] = '正因子' if results['ic_mean'] > 0 else '负因子'
+
+            # 补充：IC 自相关性
+            autocorr_1 = self._calculate_ic_autocorrelation(ic_series, lag=1)
+            results['ic_autocorr_1'] = autocorr_1
+
+            print(f"📊 IC分析结果:")
+            print(f"   IC均值: {results['ic_mean']:.4f}")
+            print(f"   月度IC均值: {results['monthly_ic_mean']:.4f}")
+            print(f"   年度IC均值: {results['annual_ic_mean']:.4f}")
+            print(f"   RankIC均值: {results['Rankic_mean']:.4f}")
+            # print(f"   IC标准差: {results['ic_std']:.4f}")
+            print(f"   IR: {results['ir']:.3f}")
+            print(f"   胜率: {results['win_rate']:.2%}")
+            print(f"   IC自相关性 (Lag 1): {autocorr_1:.4f}")
+            print(f"   因子方向: {results['factor_direction']}")
+
+        # 每日多空组合收益序列
+        if long_short_daily_returns:
+            daily_returns['long_short_returns'] = pd.concat(long_short_daily_returns)
+
+        # 分档分析 (与 IC 分析使用相同的 T->T+1 错位逻辑)
+        decile_returns_mean = self._decile_analysis_mean(data, factor_name)
+        if decile_returns_mean is not None:
+            results['decile_returns_mean'] = decile_returns_mean
+            results['monotonicity'] = self._calculate_monotonicity(decile_returns_mean)
+            print(f"   单调性: {results['monotonicity']:.3f}")
+
+        return results, daily_returns
+
+    def _calculate_ic_autocorrelation(self, ic_series: pd.Series, lag: int = 1) -> float:
+        """
+        计算 IC 序列的自相关性
+        """
+        if len(ic_series) <= lag:
+            return 0.0
+        # 将序列错位 lag 期
+        lagged_ic = ic_series.shift(lag)
+        # 计算 Pearson 相关系数 (IC 值本身就是数值，用 Pearson 即可)
+        # 排除 NaN 值
+        valid_data = pd.DataFrame({'ic': ic_series, 'lagged_ic': lagged_ic}).dropna()
+
+        if len(valid_data) < 2:
+            return 0.0
+
+        corr, _ = pearsonr(valid_data['ic'], valid_data['lagged_ic'])
+        return corr
+
+    def _decile_analysis_mean(self, data: pd.DataFrame, factor_name: str) -> Optional[pd.Series]:
+        """分档组合分析 (返回所有期平均收益)"""
+        try:
+            all_decile_returns = []
+            dates = sorted(data['date'].unique())
+
+            for i in range(len(dates) - 1):
+                # T 日的因子数据
+                current_data = data[data['date'] == dates[i]].copy()
+                # T+1 日的收益数据
+                next_data = data[data['date'] == dates[i + 1]]
+
+                if len(current_data) < 20:  # 最少20只股票
+                    continue
+
+                # 当前期分档 (T日)
+                # 使用 labels=False 返回分档数字 0-9
+                current_data['decile'] = pd.qcut(
+                    current_data[factor_name], 5, labels=False, duplicates='drop'
+                )
+
+                # 合并下一期收益 (T+1日)
+                merged = current_data.merge(
+                    next_data[['code', 'return']], on='code', suffixes=('', '_next'), how='inner'
+                )
+
+                if not merged.empty:
+                    # 计算每个分档在 T+1 日的平均收益
+                    decile_return = merged.groupby('decile')['return_next'].mean()
+                    all_decile_returns.append(decile_return)
+
+            if all_decile_returns:
+                # 对所有时间段的平均收益取平均
+                # 重新设置索引名
+                mean_returns = pd.DataFrame(all_decile_returns).mean()
+                mean_returns.index = [f'Decile {i + 1}' for i in mean_returns.index]
+                return mean_returns
+
+        except Exception as e:
+            print(f"分档分析错误: {e}")
+
+        return None
+
+    def _calculate_monotonicity(self, decile_returns: pd.Series) -> float:
+        """计算单调性"""
+        if len(decile_returns) < 2:
+            return 0
+        # 对分档数字 (0, 1, ..., 9) 和平均收益进行相关性分析
+        ranks = np.arange(len(decile_returns))
+        correlation = np.corrcoef(ranks, decile_returns.values)[0, 1]
+        return correlation if not np.isnan(correlation) else 0
+
+    def _create_plots(self, results: Dict, factor_name: str, data: pd.DataFrame):
+        # 简洁三色配色
+        colors = ['#1f77b4', '#d62728', '#7f7f7f']  # 蓝色、红色、灰色
+        # 图：分档组合收益柱状图
+        if 'decile_returns_mean' in results and len(results['decile_returns_mean']) > 0:
+            plt.figure(figsize=(10, 7))  # 增加图表尺寸，为标签留出更多空间
+            decile_returns = results['decile_returns_mean']
+            x_labels = [i for i in range(1, len(decile_returns) + 1)]
+            # 平均日收益转年化收益
+            annualized_returns = (1 + decile_returns.values) ** 252 - 1
+            y_data_percent = annualized_returns * 100  # 年化百分比收益
+
+            bar_width = 1.0
+            bars = plt.bar(x_labels, y_data_percent,
+                           width=bar_width,
+                           color=colors[0], alpha=1, edgecolor='white', linewidth=0.5)
+
+            # 负收益柱子用红色
+            for i, bar in enumerate(bars):
+                height = bar.get_height()
+                if height < 0:
+                    bar.set_color(colors[1])
+
+            # --- 核心修改：标签位置优化 (防止重叠) ---
+            # 确定图表的Y轴实际数据显示范围，为标签偏移量提供参考
+            y_min_data, y_max_data = np.min(y_data_percent), np.max(y_data_percent)
+            y_data_span = y_max_data - y_min_data
+
+            # 设置一个基于数据范围的动态最小偏移量
+            # 确保即使数据量很小，标签也能有清晰的间距
+            min_label_offset = max(y_data_span * 0.03, 0.005)  # 最小偏移量为数据范围的3%或0.005%
+
+            for i, bar in enumerate(bars):
+                height = bar.get_height()
+
+                # 标签文本
+                label_text = f'{height:.2f}%'
+
+                # 根据柱子高度正负，决定标签的垂直对齐和初始偏移方向
+                if height >= 0:
+                    va = 'bottom'
+                    # 标签放在柱子上方的固定偏移量
+                    offset = min_label_offset
+                else:
+                    va = 'top'
+                    # 标签放在柱子下方的固定偏移量
+                    offset = -min_label_offset
+
+                # 如果柱子高度为0，特殊处理标签位置，直接在0线稍上方显示
+                if np.isclose(height, 0, atol=0.001):  # 使用 np.isclose 处理浮点数接近0的情况
+                    label_text = '0.00%'
+                    va = 'bottom'
+                    offset = min_label_offset  # 确保在0线之上
+
+                # 绘制标签
+                plt.text(bar.get_x() + bar.get_width() / 2, height + offset,
+                         label_text, ha='center', va=va,
+                         fontsize=10,
+                         color='black'  # 统一标签颜色
+                         )
+
+            plt.xlim(0.5, len(decile_returns) + 0.5)
+
+            # --- 关键修改 2: 优化Y轴范围和刻度 ---
+            # 确保Y轴包含所有数据点和其标签
+            # 获取所有标签的y位置，以便确定一个合适的Y轴上限
+            all_y_labels_pos = []
+            for i, bar in enumerate(bars):
+                height = bar.get_height()
+                if height >= 0:
+                    all_y_labels_pos.append(height + min_label_offset)
+                else:
+                    all_y_labels_pos.append(height - min_label_offset)
+
+            # 结合数据本身的范围和标签的最高/最低位置来设置Y轴
+            current_y_min = y_min_data
+            current_y_max = y_max_data
+
+            # 如果有标签，确保Y轴能覆盖所有标签
+            if all_y_labels_pos:
+                current_y_max = max(current_y_max, np.max(all_y_labels_pos))
+                current_y_min = min(current_y_min, np.min(all_y_labels_pos))
+
+            # 增加额外的上下边距，使图表不拥挤
+            # 根据实际数据范围动态调整 Y 轴的上下边界
+            # 避免当所有收益都集中在狭窄区间时，图表仍然显得太空
+            y_range_padding = (current_y_max - current_y_min) * 0.15  # 增加15%的上下边距
+
+            # 确保 Y 轴下限不会过高，如果所有值都是正数，确保能看到0线
+            y_lower_bound = min(current_y_min - y_range_padding,
+                                0 if y_min_data > 0 else current_y_min - y_range_padding)
+            y_upper_bound = current_y_max + y_range_padding
+
+            if y_lower_bound == y_upper_bound:  # 避免除零错误或范围为0
+                y_lower_bound -= 0.1
+                y_upper_bound += 0.1
+
+            plt.ylim(y_lower_bound, y_upper_bound)
+
+            # 移除Y轴刻度标签，因为我们已经有柱顶标签
+            plt.yticks([])
+
+            plt.title(f'分档组合平均收益 - {factor_name}', fontsize=16, fontweight='bold', pad=20)  # 增加标题与图表的间距
+            plt.xlabel('分档 (1:最低, 5:最高)', fontsize=12)
+            plt.ylabel('年化平均收益 (%)', fontsize=12)
+            plt.xticks(x_labels, fontsize=5)  # 确保X轴刻度是 1 到 10
+            plt.axhline(y=0, color='black', linewidth=1)  # 0线
+            plt.grid(False)  # 移除背景网格
+
+            # 调整布局，防止元素重叠
+            plt.tight_layout()
+
+            # 保存到桌面
+            save_path = f'C:/Users/cufet/Desktop/{factor_name}_分档收益.png'
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"✅ 图表已保存到桌面: {save_path}")
+    #
+    def _plot_cumulative_return(self, daily_long_short_returns: pd.Series, factor_name: str):
+        """
+        绘制多空组合的累计走势图 (净值曲线)
+        """
+        # 计算累计收益率 (净值曲线：(1 + R1) * (1 + R2) * ... - 1)
+        # R = daily_returns
+        # 净值 = (1 + R).cumprod()
+        cumulative_returns = (1 + daily_long_short_returns).cumprod()
+
+        plt.figure(figsize=(10, 6))
+
+        # 绘制净值曲线
+        plt.plot(cumulative_returns.index, cumulative_returns.values,
+                 color='#d62728', linewidth=2, label='多空组合净值')
+
+        plt.title(f'多空组合累计净值走势 - {factor_name}', fontsize=14, fontweight='bold')
+        plt.xlabel('日期')
+        plt.ylabel('累计净值')
+        plt.grid(False, alpha=0)
+        plt.legend()
+
+        # 格式化x轴日期
+        plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m-%d'))
+        plt.gcf().autofmt_xdate()  # 自动旋转日期标签
+
+        # 保存到桌面
+        plt.savefig(f'C:/Users/cufet/Desktop/{factor_name}_累计走势图.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+        print(f"✅ 图表已保存到桌面: {factor_name}_累计走势图.png")
+
+        # ----------------------------------------------------
+
+    def _parse_sheet_and_fill(self, file_path, sheet_name: str) -> pd.DataFrame:
+        """
+        加载单个 Sheet 并应用脏宽表解析和填充逻辑。
+        这是一个辅助函数，将加载和解析逻辑集中起来。
+        """
+        try:
+            # 1. 确保传入 header=None，与 parse_dirty_wide_table 的逻辑匹配
+            sheet_data = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+
+            # 2. 调用核心解析函数
+            # 注意：这里的 sheet_name 已经被传入 parse_dirty_wide_table，将触发内部的 0 值填充逻辑
+            parsed_data = self.parse_dirty_wide_table(sheet_data, sheet_name)
+
+            # 3. 返回空表或有效数据
+            if parsed_data.empty:
+                return pd.DataFrame()
+
+            # 【注意】：随机模拟逻辑已包含在 parse_dirty_wide_table 内部，这里无需重复调用。
+
+            return parsed_data
+
+        except Exception as e:
+            # 捕获单个 Sheet 的错误，打印信息后返回空表
+            print(f"    ❌ 【{sheet_name}】解析失败。错误: {e}")
+            return pd.DataFrame()
+
+    def load_test_data(self):
+        """
+        专门用于测试集的加载方法：按文件遍历所有 Sheet，并确保数据被正确解析和填充。
+        """
+        # 1. 查找所有匹配的文件 (.xlsx 和 .xls)
+        excel_files = sorted(
+            list(self.data_folder.glob("中证500_*.xlsx")) +
+            list(self.data_folder.glob("中证500_*.xls"))
+        )
+
+        if not excel_files:
+            print("⚠️ 未找到本地 Excel 文件。此框架依赖完整 Excel 文件，请确认路径。")
+            return
+
+        print(f"找到 {len(excel_files)} 个数据文件")
+
+        for file in excel_files:
+            # 2. 【核心需求 1：去掉“中证500_”前缀】
+            period_name = file.stem.replace("中证500_", "")
+            print(f"\n📁 加载: {period_name}")
+
+            period_data = {}
+            try:
+                xl_file = pd.ExcelFile(file)
+
+                for sheet_name in xl_file.sheet_names:
+                    if sheet_name == 'Sheet1':
+                        # 股票基本信息表
+                        stock_info = pd.read_excel(file, sheet_name=sheet_name)
+                        period_data['stock_info'] = stock_info
+                    else:
+                        # 因子 Sheet：调用辅助函数进行加载和填充
+                        parsed_data = self._parse_sheet_and_fill(file, sheet_name)
+
+                        if not parsed_data.empty:
+                            period_data[sheet_name] = parsed_data
+
+                # 3. 存储数据
+                self.all_data[period_name] = period_data
+
+                # 打印加载成功的因子键
+                loaded_keys = [k for k in period_data.keys() if k != 'stock_info']
+                print(f"    ✅ {period_name} 文件加载完成，包含 {len(loaded_keys)} 个因子数据项。Keys: {loaded_keys}")
+
+            except Exception as e:
+                print(f"❌ 加载文件 {file.name} 失败: {e}")
+
+        # 显示数据概览
+        if self.all_data:
+            self._display_data_overview()
+
+    def load_data(self):
+        """
+        加载指定文件夹中的所有 Excel 文件，解析，并进行数据预处理（例如缺失值填充）。
+        """
+        print(f"🚀 开始加载数据...")
+
+        data_files = list(self.data_folder.glob("*.xlsx"))
+        print(f"找到 {len(data_files)} 个数据文件")
+
+        for file_path in data_files:
+            file_name_without_ext = file_path.stem
+
+            print(f"\n📁 加载: {file_name_without_ext}")
+
+            # 假设每个 Excel 文件中包含了所有因子和收益率数据
+            try:
+                raw_data = pd.read_excel(file_path, header=None)
+                # 使用你已有的解析方法
+                data_period = self.parse_dirty_wide_table(raw_data)
+
+                # 对原始财务数据进行随机向前模拟填充（这部分逻辑应该来自你原有的代码）
+                # 假设 parse_dirty_wide_table 返回的数据包含了所有列
+                for factor_name in ['ROE', '自由现金流', 'EPS', 'EBITDA']:
+                    if factor_name in data_period:
+                        print(f"   🔧 正在对 {factor_name} 进行 **随机向前模拟** 填充...")
+                        # 假设你有一个 fill_random_forward 方法或类似逻辑
+                        data_period[factor_name] = self.fill_random_forward(data_period[factor_name])
+
+                self.all_data[file_name_without_ext] = data_period
+                print(f"✅ {file_name_without_ext} 加载完成")
+
+            except Exception as e:
+                print(f"❌ 加载文件 {file_path} 失败: {e}")
+
+        print("\n" + "=" * 60)
+        print("数据加载概览")
+        print("=" * 60)
+        for period_name in self.all_data.keys():
+            print(f"📅 时间段: {period_name}")
+
+
+    def aggregate_factor_panel(self, factor_names: List[str], target_return_name: str = 'return'):
+        """
+        聚合所有时间段的因子数据和目标收益率，用于模型训练。
+        将宽表因子数据转换为长面板 (MultiIndex=(日期, 股票代码))。
+        """
+        all_factor_data_list = []
+
+        # 1. 准备所有因子的面板数据 (假设 prepare_panel_data 返回长表，包含 'date', 'code' 列)
+        factor_panel_data = {}
+        for factor_name in factor_names:
+            factor_panel_data[factor_name] = self.prepare_panel_data(factor_name)
+
+        # 2. 准备收益率数据 (长表)
+        # 假设 calculate_returns 返回的长表也包含 'date', 'code', 'return'
+        returns_df = self.calculate_returns()
+
+        # 3. 将所有因子面板合并到收益率上
+        final_merged_data = returns_df.copy()
+
+        for factor_name, factor_df in factor_panel_data.items():
+            if factor_df.empty:
+                continue
+
+            # 使用 date 和 code 作为 merge 的键
+            final_merged_data = final_merged_data.merge(
+                factor_df[['date', 'code', factor_name]],
+                on=['date', 'code'],
+                how='inner'
+            )
+
+        # 4. 清理和返回
+        required_columns = factor_names + [target_return_name]
+        final_data_clean = final_merged_data.dropna(subset=required_columns)
+
+        X_final = final_data_clean[factor_names].copy()
+        y_final = final_data_clean[target_return_name].copy()
+
+        # **致命错误修正点：确保索引正确设置**
+        # 在 merge 之后，'date' 和 'code' 仍然是列。为了让 LASSO 使用 MultiIndex，我们需要设置它。
+
+        # 我们需要获取对齐后的 (date, code) 索引，并将它设置给 X_final
+        # 此时 final_data_clean 仍是带有 date, code 列的 DataFrame
+
+        X_final['date'] = final_data_clean['date']
+        X_final['code'] = final_data_clean['code']
+        y_final = y_final.set_axis(X_final.index)  # 确保 Series 的 index 是对齐的
+
+        if not X_final.empty:
+            # **关键修复：将 date 和 code 设置为 MultiIndex**
+            X_final = X_final.set_index(['date', 'code'])
+            y_final.index = X_final.index
+        else:
+            # 如果数据为空，返回空对象
+            return pd.DataFrame(), pd.Series()
+
+        print(f"✅ 聚合数据对齐完成。用于训练的 (日期-股票) 样本总数: {len(X_final)}")
+
+        return X_final, y_final
+
+def _get_aligned_data_for_lasso(analyzer, factor_names, target_return_name='return'):
+    """
+    【外部实现数据对齐】
+    利用 analyzer 的现有方法，将所有因子和目标收益率合并并对齐成面板数据。
+
+    Args:
+        analyzer: CS500FactorAnalyzer 实例。
+        factor_names: 用于 LASSO 的因子名称列表（X）。
+        target_return_name: 目标收益率的列名（Y）。
+
+    Returns:
+        X (pd.DataFrame): 对齐后的特征矩阵。
+        Y (pd.Series): 对齐后的目标变量。
+    """
+
+    print("🔍 正在聚合因子面板数据...")
+
+    # 1. 准备所有因子数据 (X)
+    all_factor_panels = []
+
+    for factor_name in factor_names:
+        # 使用框架自带的 prepare_panel_data 获取长表
+        factor_panel = analyzer.prepare_panel_data(factor_name)
+        if not factor_panel.empty:
+            # 确保只保留日期、代码和因子值
+            factor_panel = factor_panel[['date', 'code', factor_name]]
+            all_factor_panels.append(factor_panel)
+
+    if not all_factor_panels:
+        print("⚠️ 无法获取任何因子数据。")
+        return pd.DataFrame(), pd.Series()
+
+    # 2. 依次合并所有因子面板数据
+    merged_factors = all_factor_panels[0]
+    for i in range(1, len(all_factor_panels)):
+        merged_factors = merged_factors.merge(
+            all_factor_panels[i],
+            on=['date', 'code'],
+            how='inner'  # 确保只有所有因子都有值的样本被保留
+        )
+
+    # 3. 准备目标收益率 (Y)
+    returns_df = analyzer.calculate_returns()
+
+    # 4. 合并因子和收益率，实现最终对齐
+    final_merged_data = merged_factors.merge(
+        returns_df[['date', 'code', target_return_name]],
+        on=['date', 'code'],
+        how='inner'
+    )
+
+    # 5. 清理和分割
+    final_merged_data = final_merged_data.dropna()
+
+    # 分割 X (特征) 和 Y (目标)
+    X = final_merged_data[['date', 'code'] + factor_names]
+    Y = final_merged_data[target_return_name]
+
+    print(f"✅ 数据对齐完成。用于训练的 (日期-股票) 样本总数: {len(X)}")
+
+    return X, Y
+
+
+# ----------------------------------------------------
+# **【修复 1：缺失的训练数据聚合方法】**
+# ----------------------------------------------------
+
+
+def calculate_lasso_composite(
+        analyzer,
+        factor_names,
+        alpha=0
+):
+    """
+    训练 LASSO 模型，生成复合因子，并将模型对象保存到磁盘。
+
+    注意：此函数返回的结果是一个 Series/DataFrame，用于 analyzer.calculate_synthetic_factor 存储。
+    """
+
+    # 1. 数据对齐 (调用外部函数)
+    # X_panel 包含 ['date', 'code'] 列，X_train 只包含因子列
+    X_panel, Y = analyzer._get_aligned_data_for_lasso(analyzer, factor_names, target_return_name='return')
+
+    if X_panel.empty:
+        print("❌ 无法训练 LASSO：对齐后的数据为空。")
+        # 返回一个空的 DataFrame 以满足 calculate_synthetic_factor 的要求
+        return pd.DataFrame()
+
+        # 提取纯特征矩阵进行训练
+    X_train = X_panel[factor_names].values
+
+    # 2. 执行 LASSO 回归
+    print(f"\n🧠 开始 LASSO 回归 (Alpha={alpha})...")
+    lasso_model = Lasso(alpha=alpha, max_iter=100)
+    lasso_model.fit(X_train, Y.values)
+
+    # 3. 记录和保存模型
+    print(f"\n--- LASSO 模型结果 (Alpha={alpha}) ---")
+    print(f"截距 (Intercept): {lasso_model.intercept_:.6f}")
+    print("选定的因子及其系数:")
+    # 打印非零系数
+    for name, coef in zip(factor_names, lasso_model.coef_):
+        if np.abs(coef) > 1e-6:
+            print(f"  {name}: {coef:.6f}")
+    # 将模型对象和特征顺序一起保存，以便在新数据上重用
+    model_data = {
+        'model': lasso_model,
+        'feature_names': factor_names  # 关键：保存训练时的特征顺序
+    }
+    MODEL_OUTPUT_PATH = "C:/Users/cufet/Desktop/lasso_composite_model.joblib"  # 确保路径可写
+    joblib.dump(model_data, MODEL_OUTPUT_PATH)
+    print(f"\n✅ LASSO 模型和特征顺序已保存到: {MODEL_OUTPUT_PATH}")
+    # 4. 生成复合因子值
+    # 复合因子值 = 训练集上的预测值
+    composite_factor_values = lasso_model.predict(X_train)
+    # 5. 组装成时间序列宽表 (满足 analyzer.calculate_synthetic_factor 的要求)
+
+    # 创建长表 Series
+    composite_factor_long = pd.Series(
+        composite_factor_values,
+        index=X_panel.index,  # 使用训练数据的 index
+        name="LASSO_Composite_Value"
+    )
+
+    # 将日期、代码、复合因子值合并
+    result_long_df = X_panel[['date', 'code']].copy()
+    result_long_df['LASSO_Composite'] = composite_factor_long.values
+
+    # 找到当前 period 的数据并转换回宽表
+    current_period_name = list(analyzer.all_data.keys())[0]  # 这是一个临时的、不严谨的假设！
+
+
+    return result_long_df.set_index('date').pivot(columns='code', values='LASSO_Composite').fillna(
+        0)  # 这是一个不严谨的宽表，但结构上符合要求。
+
+    # --- 修正后的模型训练和应用函数 ---
+
+    # 1. 训练和保存模型 (只执行一次)
+
+
+def train_and_save_lasso_model(analyzer, feature_names: List[str], alpha: float, model_path: str):
+    """
+    聚合因子面板数据，将它们与收益率对齐，标准化后训练 LASSO 模型，并保存模型和 Scaler。
+    """
+    print("\n🔍 正在聚合因子面板数据...")
+
+    # 1. 聚合因子数据和收益率数据
+    X_merged, y_merged = analyzer.aggregate_factor_panel(feature_names)
+
+    if X_merged.empty or y_merged.empty:
+        print("⚠️ 警告：聚合数据为空，无法训练 LASSO 模型。")
+        return
+
+    # 将聚合后的数据转换为 NumPy 数组
+    X_values = X_merged.values
+    y_values = y_merged.values
+
+    # ----------------------------------------------------
+    # **【修正 1：关键：对输入特征 X 进行标准化 (Standardization)】**
+    # ----------------------------------------------------
+    # 初始化标准化器
+    scaler = StandardScaler()
+
+    # 对特征数据进行拟合和转换 (Fit and Transform)，scaler 会学习数据的均值和标准差
+    X_values_standardized = scaler.fit_transform(X_values)
+
+    print(f"✅ 数据对齐完成。用于训练的 (日期-股票) 样本总数: {X_values_standardized.shape[0]}")
+
+    # 2. 训练 LASSO 模型
+    # 提示：由于数据已标准化，alpha 通常需要调小
+    lasso_model = Lasso(alpha=alpha, max_iter=10000, random_state=42)
+
+    # 确保模型训练使用标准化后的数据
+    print(f"拟合 LASSO 模型 (样本数: {X_values_standardized.shape[0]}, 特征数: {X_values_standardized.shape[1]})...")
+    lasso_model.fit(X_values_standardized, y_values)
+
+    # 3. 保存模型、特征顺序和 Scaler
+    # 必须保存 scaler，因为应用模型时需要用它来转换新的数据！
+    joblib.dump({
+        'model': lasso_model,
+        'feature_names': feature_names,
+        'scaler': scaler  # <-- 必须保存 Scaler 对象
+    }, model_path)
+
+    # 打印最终的模型参数以供检查
+    print(f"LASSO模型参数： {{'model': {lasso_model}, 'feature_names': {feature_names}}}")
+    print(f"✅ LASSO 模型、特征顺序和 Scaler 已保存到: {model_path}")
+# 2. 模型应用函数 (供 calculate_synthetic_factor 调用)
+def apply_lasso_composite_to_period(analyzer,period_name, factor_names, model_path):
+    """
+    为 CS500FactorAnalyzer.calculate_synthetic_factor 所需的计算函数。
+    它接收一个 period_data，应用模型并返回该 period 的宽表结果。
+    """
+    try:
+        # 1. 加载模型和特征顺序
+        loaded_data = joblib.load(model_path)
+        loaded_model = loaded_data['model']
+        # 确保这里加载的特征顺序和训练时一致
+        TRAINING_FACTOR_NAMES = loaded_data['feature_names']
+
+        # 2. 准备当前 period 的特征数据 (宽表)
+        period_factor_data = {}
+
+        # 获取当前 period 的原始数据
+        period_raw_data = analyzer.all_data.get(period_name, {})
+
+        for factor_name in factor_names:
+            # 尝试从**基础因子**中获取
+            if factor_name in period_raw_data:
+                period_factor_data[factor_name] = period_raw_data[factor_name]
+
+            # 尝试从 **已计算的合成因子** 中获取
+            elif factor_name in analyzer.synthetic_factors and period_name in analyzer.synthetic_factors[factor_name]:
+                period_factor_data[factor_name] = analyzer.synthetic_factors[factor_name][period_name]
+
+            # 如果找不到该因子，应该打印警告或跳过该周期
+            else:
+                # 这可能表示这个因子在当前周期确实没有被成功计算
+                print(f"   ⚠️  因子 '{factor_name}' 在周期 '{period_name}' 缺失，跳过此周期。")
+                return pd.DataFrame()
+
+                # 3. 将所有宽表合并成一个宽表
+        X_wide = pd.concat(period_factor_data.values(), axis=1, keys=period_factor_data.keys()).swaplevel(axis=1)
+        # 确保只保留与 TRAINING_FACTOR_NAMES 顺序一致的列 (去重并重新排序)
+        X_wide = X_wide.reindex(columns=TRAINING_FACTOR_NAMES, level=0)
+        X_wide.columns = X_wide.columns.droplevel(1)  # 删除多余的第二层列名
+
+        # 4. 移除缺失值并转换为 NumPy 数组 (X)
+        X_filled = X_wide.fillna(method='ffill')
+        X_train_period = X_filled.dropna(how='any').copy()
+        X_values = X_train_period.values
+        if X_values.size == 0:
+            return pd.DataFrame()
+
+        # 5. 应用模型进行预测
+        composite_values = loaded_model.predict(X_values)
+
+        # 6. 转换回时间序列宽表 (Index=date, Columns=code)
+
+        composite_df = pd.DataFrame(
+            composite_values,
+            index=X_train_period.index,
+            columns=X_train_period.columns  # 这里的列名是股票代码
+        )
+
+        # 返回宽表
+        composite_df.index.name = 'date'
+        composite_df.columns.name = 'code'
+
+        return composite_df
+
+    except Exception as e:
+        print(f"❌ LASSO 应用失败: {e}")
+        return pd.DataFrame()
+
+
+# 确保在 main 函数外定义这个创建器函数，并且保持 joblib.load 和模型变量的闭包
+def create_lasso_applier(analyzer, factor_names, model_path):
+    # 1. 模型加载和参数准备 (只执行一次)
+    loaded_data = joblib.load(model_path)
+    loaded_model = loaded_data['model']
+    TRAINING_FACTOR_NAMES = loaded_data['feature_names']
+    loaded_scaler = loaded_data['scaler']  # <-- 必须加载 Scaler
+
+    # 2. 返回内部的 apply_func
+    def apply_func(period_data):
+        # A. 查找当前的 period_name （通过内存地址比较，保持不变）
+        current_period_name = None
+        for name, data in analyzer.all_data.items():
+            if data is period_data:
+                current_period_name = name
+                break
+
+        if current_period_name is None:
+            return pd.DataFrame()
+
+        # B. 核心：从 analyzer 的两个地方获取数据（保持不变）
+        period_factor_data = {}
+        for factor_name in TRAINING_FACTOR_NAMES:
+            if factor_name in period_data:
+                period_factor_data[factor_name] = period_data[factor_name]
+            elif factor_name in analyzer.synthetic_factors and current_period_name in analyzer.synthetic_factors[
+                factor_name]:
+                period_factor_data[factor_name] = analyzer.synthetic_factors[factor_name][current_period_name]
+            else:
+                # 缺少任一因子则返回空 DataFrame
+                # print(f"DEBUG: Period {current_period_name} missing factor {factor_name}")
+                return pd.DataFrame()
+
+        # ----------------------------------------------------
+        # **【修正后的核心：Long-Panel 合并、预测、Unstack】**
+        # ----------------------------------------------------
+
+        # 3. 将所有宽表（Index=Date, Columns=Code）转为 Long-Panel（MultiIndex=(Date, Code), Columns=Feature）
+        X_long_list = []
+        for factor_name, factor_df in period_factor_data.items():
+            # 使用 stack() 将宽表转为长表，并将其命名为因子名称
+            long_factor = factor_df.stack().to_frame(factor_name)
+            X_long_list.append(long_factor)
+
+        # 将所有长表特征合并成一个特征矩阵 X_merged (按 (Date, Code) 索引对齐)
+        X_merged = pd.concat(X_long_list, axis=1)
+
+        # 确保列顺序与训练时一致
+        X_merged = X_merged[TRAINING_FACTOR_NAMES]
+
+        # 4. 填充并清理（注意：ffill 默认在 axis=0 上运行，即时间轴）
+        X_filled = X_merged.fillna(method='ffill').fillna(method='bfill')  # 额外增加 bfill 确保首日数据可用
+        X_train_period = X_filled.dropna(how='any').copy()
+        X_values = X_train_period.values
+
+        if X_values.size == 0:
+            # print(f"DEBUG: Period {current_period_name} resulted in zero valid samples after dropna.")
+            return pd.DataFrame()
+
+            # 5. 应用模型进行预测
+        composite_values = loaded_model.predict(X_values)
+
+        # 6. 转换回时间序列宽表
+        # composite_values 是预测得分 (1D 数组)，索引是 MultiIndex(Date, Code)
+        composite_series = pd.Series(
+            composite_values,
+            index=X_train_period.index,  # MultiIndex (Date, Code)
+            name='LASSO_Composite_Value'
+        )
+
+        # 使用 unstack(level='code') 将 Series (MultiIndex) 转换回宽表 (Index=Date, Columns=Code)
+        composite_df = composite_series.unstack(level='code')
+
+        # 7. 清理和返回
+        composite_df.index.name = 'date'
+        composite_df.columns.name = 'code'
+
+        return composite_df
+
+    return apply_func
+
+
+def main():
+    analyzer = CS500FactorAnalyzer(data_folder="C:/Users/cufet/Desktop/投资组合管理")
+
+    # 1. 加载数据
+    print("🚀 开始加载数据...")
+    analyzer.load_all_periods()
+
+    # 2. 计算合成因子
+    print("\n🔧 开始计算合成因子...")
+    # Alpha因子的计算逻辑已修改为每日滚动
+    analyzer.calculate_synthetic_factor("Alpha#1", analyzer.calculate_alpha1)
+    analyzer.calculate_synthetic_factor("Alpha#2", analyzer.calculate_alpha2)
+    analyzer.calculate_synthetic_factor("Alpha#3", analyzer.calculate_alpha3)
+    analyzer.calculate_synthetic_factor("ROC6", analyzer.calculate_ROC6)
+    analyzer.calculate_synthetic_factor("BIAS60", analyzer.calculate_BIAS60)
+    analyzer.calculate_synthetic_factor("CCI20", analyzer.calculate_CCI20)
+    analyzer.calculate_synthetic_factor("WVAD6", analyzer.calculate_WVAD6)
+    analyzer.calculate_synthetic_factor("EP", analyzer.calculate_EP_Factor)
+    analyzer.calculate_synthetic_factor("ROE", analyzer.calculate_ROE_Factor)
+    analyzer.calculate_synthetic_factor("EPS增长", analyzer.calculate_EPS_Growth_Factor)
+    analyzer.calculate_synthetic_factor("Turnover20", analyzer.calculate_Turnover20_Factor)
+    analyzer.calculate_synthetic_factor("动量价值复合", analyzer.calculate_momentum_value_composite)
+    analyzer.calculate_synthetic_factor("波动调整价值", analyzer.calculate_vol_adjusted_value)
+    analyzer.calculate_synthetic_factor("量价背离", analyzer.calculate_volume_price_divergence)
+    analyzer.calculate_synthetic_factor("盈利增长", analyzer.calculate_profitability_growth)
+
+    global all_factors
+    all_factors = [
+        "Alpha#1", "Alpha#2", "Alpha#3", "ROC6", "BIAS60", "CCI20",
+        "WVAD6", "EP", "ROE", "EPS增长", "Turnover20",
+        "动量价值复合", "波动调整价值", "量价背离", "盈利增长"
+    ]
+    MODEL_PATH = "C:/Users/cufet/Desktop/lasso_composite_model.joblib"  # 保存路径
+
+    print("\n🧠 开始 LASSO 训练和模型保存...")
+    train_and_save_lasso_model(analyzer, all_factors, alpha=0.0005, model_path=MODEL_PATH)
+
+    # LASSO 步骤 3：计算并存储复合因子 (在框架循环中应用已保存的模型)
+    print("\n🔧 开始计算 LASSO 复合因子 (应用模型)...")
+    # 使用 lambda 函数调用应用逻辑，并将模型路径传递进去
+    lasso_applier_func = create_lasso_applier(analyzer, all_factors, MODEL_PATH)
+
+    analyzer.calculate_synthetic_factor(
+        "LASSO_Composite",
+        lasso_applier_func  # 传入闭包函数
+    )
+
+    def print_lasso_coefficients(model_path):
+        """加载模型并打印每个因子的权重系数"""
+        try:
+            # 1. 加载保存的数据
+            loaded_data = joblib.load(model_path)
+            loaded_model = loaded_data['model']
+            feature_names = loaded_data['feature_names']
+
+            # 2. 提取系数
+            coefficients = loaded_model.coef_
+
+            # 3. 将因子名称和系数配对
+            coef_df = pd.DataFrame({
+                'Factor': feature_names,
+                'Coefficient': coefficients
+            }).sort_values(by='Coefficient', key=lambda x: np.abs(x), ascending=False)
+
+            print("\n============================================================")
+            print(f" LASSO 复合因子权重 (Alpha={loaded_model.alpha})")
+            print("============================================================")
+            print(coef_df.to_string(index=False))  # to_string 确保完整显示
+            print("============================================================")
+
+            # 补充：检查有多少个系数被压缩到零
+            zero_count = (np.abs(coefficients) < 1e-6).sum()
+            print(f"被 LASSO 压缩到零的因子数量 (绝对值 < 1e-6): {zero_count} / {len(coefficients)}")
+
+        except Exception as e:
+            print(f"❌ 打印 LASSO 系数失败: {e}")
+
+    # 在分析因子之前调用这个函数
+    print_lasso_coefficients(MODEL_PATH)
+
+    # 3. 分析因子
+    print("\n📊 开始因子分析...")
+    # factors_to_analyze = ["Alpha#1"]  # , "Alpha#2", "Alpha#3"
+    # factors_to_analyze = ["Alpha#2"]
+    # factors_to_analyze = ["Alpha#3"]
+    # factors_to_analyze = ["ROC6"]
+    # factors_to_analyze = ["BIAS60"]
+    # factors_to_analyze = ["CCI20"]
+    # factors_to_analyze = ["WVAD6"]
+    # factors_to_analyze = ["EP"]
+    # factors_to_analyze = ["ROE"]
+    # factors_to_analyze = ["EPS增长"]
+    # factors_to_analyze = ["Turnover20"]
+    # factors_to_analyze = [
+    #     "动量价值复合",
+    #     "波动调整价值",
+    #     "量价背离",
+    #     "盈利增长"
+    # ]
+    factors_to_analyze = ["LASSO_Composite"]
+    for factor in factors_to_analyze:
+        analyzer.analyze_factor(factor,plot=True)
+
+
+if __name__ == "__main__":
+    main()
+
+#####代码结构的问题，用下面这些代码在测试集上测试
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')  # 保留您的TkAgg设置
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, List, Optional, Callable
+import warnings
+import os
+from typing import Dict
+from scipy.stats import pearsonr
+from sklearn.linear_model import Lasso
+import joblib # 导入 joblib 用于保存模型
+from sklearn.preprocessing import StandardScaler
+# 配置中文显示和警告过滤
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
+matplotlib.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore')
+
+class CS500FactorAnalyzer:
+
+    def __init__(self, data_folder: str):
+        self.data_folder = Path(data_folder)
+        self.all_data = {}
+        self.factor_results = {}
+        self.synthetic_factors = {}
+
+    def parse_dirty_wide_table(self, raw_data: pd.DataFrame, sheet_name: str = None) -> pd.DataFrame:
+        try:
+            data = raw_data.copy()
+            # 1. 设置列名为股票代码（第1行，索引 0）
+            data.columns = data.iloc[0].values
+            # 2. 删除前两行（代码行和名称行）
+            clean_data = data.iloc[2:].copy()
+            # 3. 设置时间索引（第一列）
+            time_col_name = clean_data.columns[0]
+            clean_data = clean_data.set_index(time_col_name)
+            cleaned_index = [val if not isinstance(val, tuple) else pd.NaT for val in clean_data.index]
+            clean_data.index = pd.Index(cleaned_index)
+            # 4. 解析时间索引并转为数值
+            clean_data.index = pd.to_datetime(clean_data.index)
+            # 确保数据列是数值类型，非数值转为 NaN
+            clean_data = clean_data.apply(pd.to_numeric, errors='coerce')
+
+            # 5. 清理和统一命名 (先删除全为空的列，再进行填充)
+            clean_data = clean_data.dropna(axis=1, how='all')
+
+            # ==================== 0值和缺失值处理逻辑 (新增/修改) ====================
+            target_sheets = ['ROE', '自由现金流', 'EPS', 'EBITDA']
+
+            if sheet_name in target_sheets:
+                # 针对特定 sheets: 0值采用随机模拟填充
+                print(f"   🔧 正在对 {sheet_name} 进行 **随机向前模拟** 填充...")
+
+                # 找出所有 0 值的 mask
+                zero_mask = (clean_data == 0)
+
+                for col in clean_data.columns:
+                    series = clean_data[col]
+                    zero_indices = series[zero_mask[col]].index
+
+                    if not zero_indices.empty:
+                        # 1. 临时将 0 替换为 NaN
+                        temp_series = series.replace(0, np.nan)
+
+                        # 2. 反向填充 (bfill) 得到“后面第一个非零值 V”
+                        # 相当于 series.bfill() 的效果
+                        next_non_zero = temp_series.iloc[::-1].ffill().iloc[::-1]
+
+                        # 3. 提取对应于 0 索引的 V 值
+                        next_non_zero_for_zeros = next_non_zero.loc[zero_indices]
+
+                        # 4. 生成均匀随机数 U(0, 1)
+                        random_uniform = np.random.rand(len(zero_indices))
+
+                        # 5. 模拟值 = V + U(0, 1) - 0.5
+                        simulated_values = next_non_zero_for_zeros + random_uniform - 0.5
+
+                        # 6. 填充回原数据
+                        clean_data.loc[zero_indices, col] = simulated_values
+
+                # 7. 对可能存在的原始 NaN 或序列末尾未被填充的 0 进行标准的前后填充
+                clean_data = clean_data.fillna(method='ffill').fillna(method='bfill')
+
+            else:
+                # 其他 sheets: 0 和 NaN 都采用 ffill/bfill 标准填充
+                # 1. 将 0 视为缺失值 (NaN)，以便统一填充
+                clean_data = clean_data.replace(0, np.nan)
+
+                # 2. ffill 和 bfill 填充
+                # print(f"   🔧 正在对 {sheet_name} 进行 **ffill/bfill** 填充 ...")
+                clean_data = clean_data.fillna(method='ffill').fillna(method='bfill')
+
+
+            # ==================== 0值和缺失值处理逻辑 (结束) ====================
+
+            # 6. 清理和统一命名 (与原有逻辑一致)
+            clean_data.columns.name = 'code'
+            clean_data.index.name = 'date'
+
+            return clean_data
+
+        except Exception as e:
+            print(f"❌ 解析 {sheet_name} 失败: {e}")
+            raise
+
+    def load_all_periods(self):
+        """加载所有时间点的数据"""
+
+        # 1. 查找所有匹配的文件 (.xlsx 和 .xls)，并按名称排序
+        excel_files = sorted(
+            list(self.data_folder.glob("中证500_*.xlsx")) +
+            list(self.data_folder.glob("中证500_*.xls"))
+        )
+
+        if not excel_files:
+            print(
+                f"⚠️ 未找到本地 Excel 文件。请检查路径：{self.data_folder} 下是否存在命名为 '中证500_*.xlsx' 或 '中证500_*.xls' 的文件。")
+            return
+
+        print(f"找到 {len(excel_files)} 个数据文件")
+
+        for file in excel_files:
+            # 【修改 1：提取周期名称，并去掉 "中证500_" 前缀】
+            period_name = file.stem.replace("中证500_", "")
+            print(f"\n📁 加载: {period_name}")
+
+            try:
+                xl_file = pd.ExcelFile(file)
+                period_data = {}
+
+                for sheet_name in xl_file.sheet_names:
+                    # Sheet1 通常是股票基本信息
+                    if sheet_name == 'Sheet1':
+                        stock_info = pd.read_excel(file, sheet_name=sheet_name)
+                        period_data['stock_info'] = stock_info
+                    else:
+                        # 其他 Sheet 是因子数据，需要脏宽表解析
+                        # 确保传入 header=None，与 parse_dirty_wide_table 匹配
+                        sheet_data = pd.read_excel(file, sheet_name=sheet_name, header=None)
+                        try:
+                            # 调用解析函数。此时，sheet_name 被传入，用于触发 parse_dirty_wide_table 中的随机模拟逻辑
+                            parsed_data = self.parse_dirty_wide_table(sheet_data, sheet_name)
+
+                            # 如果解析后数据为空，则跳过
+                            if parsed_data.empty:
+                                continue
+
+                            period_data[sheet_name] = parsed_data
+
+                        except Exception:
+                            # 捕获解析 Sheet 内部的错误，继续处理下一个 Sheet
+                            continue
+
+                # 【修改 2：使用去掉前缀的 period_name 作为 all_data 的 Key】
+                self.all_data[period_name] = period_data
+
+                # 打印加载成功的因子键
+                loaded_keys = [k for k in period_data.keys() if k != 'stock_info']
+
+                # 【修改 3：在加载完成的输出中，也使用去掉前缀的 period_name】
+                print(f"    ✅ {period_name} 文件加载完成，包含 {len(loaded_keys)} 个因子数据项。Keys: {loaded_keys}")
+
+
+            except Exception as e:
+                print(f"❌ 加载文件 {file.name} 失败: {e}")
+
+        # 显示数据概览
+        if self.all_data:
+            self._display_data_overview()
+        else:
+            print("\n⚠️  没有成功加载任何数据")
+
+
+    def _display_data_overview(self):
+        """显示数据概览"""
+        print(f"\n{'=' * 60}")
+        print("数据加载概览")
+        print(f"{'=' * 60}")
+
+        for period_name, period_data in self.all_data.items():
+            print(f"\n📅 时间段: {period_name}")
+
+    def calculate_synthetic_factor(self, factor_name: str, calculation_func: Callable):
+        """
+        计算合成因子
+        """
+        print(f"\n🔧 计算合成因子: {factor_name}")
+        self.synthetic_factors[factor_name] = {}
+
+        success_count = 0
+        for period_name, period_data in self.all_data.items():
+            try:
+                # 传入 period_data (包含所有时间序列宽表)
+                # factor_data = calculation_func(period_data)
+                factor_data = calculation_func(self, period_data)
+
+                # 检查返回结果是否为每日时间序列宽表
+                if not factor_data.empty and factor_data.index.name == 'date' and factor_data.columns.name == 'code':
+                    self.synthetic_factors[factor_name][period_name] = factor_data
+                    success_count += 1
+                    print(
+                        f"   ✅ {period_name}: 计算成功, 每日截面: {len(factor_data)}, 股票数: {len(factor_data.columns)}")
+                else:
+                    print(f"   ⚠️  {period_name}: 无有效数据或数据格式错误")
+            except Exception as e:
+                print(f"   ❌ {period_name}: 计算失败 - {e}")
+
+        print(f"📈 {factor_name} 计算完成: {success_count}/{len(self.all_data)} 个时间段")
+
+    # ==================== 每日滚动因子计算方法 ====================
+    def calculate_alpha1(self, period_data: Dict) -> pd.DataFrame:
+        if '收盘价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少收盘价或成交量数据")
+
+        close_df = period_data['收盘价']
+        volume_df = period_data['成交量']
+
+        # 1. 确保数据对齐
+        common_stocks = close_df.columns.intersection(volume_df.columns)
+        close_df = close_df[common_stocks]
+        volume_df = volume_df[common_stocks]
+        close_rank_cs = close_df.rank(axis=1, pct=True)  # 每天在所有股票中排名
+        volume_rank_cs = volume_df.rank(axis=1, pct=True)
+
+        # 1b. 计算这两组排名序列在过去10天的**时间序列**相关性 (rolling(10).corr())
+        # 这样计算的是**斯皮尔曼等级相关系数** (Spearman's rank correlation coefficient)
+        # 对每只股票，计算其过去10天的 (close_rank_cs, volume_rank_cs) 的相关性。
+        corr_term_raw = close_rank_cs.rolling(window=10).corr(volume_rank_cs)
+
+        # --- Step 2: rank(correlation_term) * rank(delta_term) ---
+
+        # 2a. 对相关性项进行**截面**排名: rank(corr_term_raw)
+        rank_corr_term = corr_term_raw.rank(axis=1, pct=True)
+
+        # 2b. 滚动计算价格变化项: delta(close, 5)
+        delta_term_raw = close_df.diff(5)
+
+        # 2c. 对价格变化项进行**截面**排名: rank(delta(close, 5))
+        rank_delta_term = delta_term_raw.rank(axis=1, pct=True)
+
+        # 2d. 组合: rank(correlation(...)) * rank(delta(...))
+        raw_factor_df = rank_corr_term * rank_delta_term
+
+        # --- Step 3: 最终因子值 (原始因子值是每日截面值) ---
+        # 对最终结果进行截面排名，这是通常的做法，以确保因子值分布统一
+        alpha1_df = raw_factor_df.rank(axis=1, pct=True, method='average')
+
+        # 清理和统一命名
+        alpha1_df.columns.name = 'code'
+        alpha1_df.index.name = 'date'
+
+        # 删除所有股票都是 NaN 的日期
+        return alpha1_df.dropna(how='all')
+
+    def calculate_alpha2(self, period_data: Dict) -> pd.DataFrame:
+        """
+        Alpha#2 (每日滚动): rank(delta(close, 5)) * rank(delta(volume, 5))
+        """
+        if '收盘价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少收盘价或成交量数据")
+
+        close_df = period_data['收盘价']
+        volume_df = period_data['成交量']
+
+        common_stocks = close_df.columns.intersection(volume_df.columns)
+        close_df = close_df[common_stocks]
+        volume_df = volume_df[common_stocks]
+
+        # 1. 5日价格变化: delta(close, 5)
+        delta_close = close_df.diff(5)
+        # 2. 5日成交量变化: delta(volume, 5)
+        delta_volume = volume_df.diff(5)
+
+        # 3. 截面排名 (Cross-sectional Rank): 这是关键！
+        # rank(delta(close, 5))
+        ranked_delta_close = delta_close.rank(axis=1, pct=True, method='average')
+        # rank(delta(volume, 5))
+        ranked_delta_volume = delta_volume.rank(axis=1, pct=True, method='average')
+
+        # 4. 最终因子值: 两个排名值的乘积
+        alpha2_df = ranked_delta_close * ranked_delta_volume
+
+        alpha2_df.columns.name = 'code'
+        alpha2_df.index.name = 'date'
+
+        # 删除所有股票都是 NaN 的日期
+        return alpha2_df.dropna(how='all')
+
+    def calculate_alpha3(self, period_data: Dict) -> pd.DataFrame:
+        """
+        Alpha#3 (每日滚动): rank(stddev(close, 10)) * rank(delta(volume, 5))
+        这里我们计算：rank(stddev(close, 10)) * rank(delta(volume, 5))
+        """
+        if '收盘价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少收盘价或成交量数据")
+
+        close_df = period_data['收盘价']
+        volume_df = period_data['成交量']
+
+        common_stocks = close_df.columns.intersection(volume_df.columns)
+        close_df = close_df[common_stocks]
+        volume_df = volume_df[common_stocks]
+
+        # 1. 滚动计算10日波动率: stddev(close, 10)
+        volatility_term = close_df.rolling(window=10).std()
+
+        # 2. 滚动计算5日成交量变化: delta(volume, 5)
+        delta_volume_term = volume_df.diff(5)
+
+        # 3. 截面排名: 分别对两个项进行每日截面排名
+        # rank(stddev(close, 10))
+        ranked_volatility = volatility_term.rank(axis=1, pct=True, method='average')
+
+        # rank(delta(volume, 5))
+        ranked_delta_volume = delta_volume_term.rank(axis=1, pct=True, method='average')
+
+        # 4. 最终因子值: 两个排名值的乘积
+        alpha3_df = ranked_volatility * ranked_delta_volume
+
+        alpha3_df.columns.name = 'code'
+        alpha3_df.index.name = 'date'
+
+        return alpha3_df.dropna(how='all')
+
+    def calculate_ROC6(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: ROC6 (6周期价格变化率)
+        公式: (收盘价 / N周期前收盘价 - 1) * 100
+        """
+        if '收盘价' not in period_data:
+            raise ValueError("缺少收盘价数据")
+
+        close_df = period_data['收盘价']
+
+        # 计算 N=6 周期前的收盘价
+        close_lagged = close_df.shift(6)
+
+        # 计算ROC6
+        ROC6_df = ((close_df / close_lagged) - 1) * 100
+
+        # 截面排名 (可选，但通常因子都需要排名或标准化)
+        factor_df = ROC6_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+    def calculate_BIAS60(self, period_data: Dict) -> pd.DataFrame:
+        """calculate_synthetic_factor
+        因子: BIAS60 (60周期价格乖离率)
+        公式: (收盘价 - 60周期均价) / 60周期均价 * 100
+        """
+        if '收盘价' not in period_data:
+            raise ValueError("缺少收盘价数据")
+
+        close_df = period_data['收盘价']
+
+        # 计算60周期简单移动平均线 (Simple Moving Average, SMA)
+        MA60 = close_df.rolling(window=60).mean()
+
+        # 计算BIAS60
+        BIAS60_df = ((close_df - MA60) / MA60) * 100
+
+        # 截面排名
+        factor_df = BIAS60_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+    def calculate_CCI20(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: CCI20 (20周期商品通道指数)
+        """
+        if '收盘价' not in period_data or '日最高价' not in period_data or '日最低价' not in period_data:
+            raise ValueError("缺少收盘价、最高价或最低价数据")
+
+        close_df = period_data['收盘价']
+        high_df = period_data['日最高价']
+        low_df = period_data['日最低价']
+        N = 20
+
+        # 1. 计算 Typical Price (TP)
+        TP_df = (high_df + low_df + close_df) / 3
+
+        # 2. 计算 TP 的 N 周期 SMA (SMATP)
+        SMATP_df = TP_df.rolling(window=N).mean()
+
+        # 3. 计算 N 周期平均绝对偏差 (Mean Deviation)
+        # MeanDeviation = SMA(|TP - SMATP|, N)
+        MD_df = (TP_df - SMATP_df).abs().rolling(window=N).mean()
+
+        # 4. 计算 CCI
+        # 避免除以零
+        MD_df_safe = MD_df.replace(0, np.nan)
+        CCI20_df = (TP_df - SMATP_df) / (0.015 * MD_df_safe)
+
+        # 截面排名
+        factor_df = CCI20_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+    def calculate_WVAD6(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: WVAD (6周期加权成交量变异度 - 平滑形式)
+        公式: SMA( ( (Close - Open) / (High - Low) ) * Volume , 6 )
+        """
+        if '收盘价' not in period_data or '开盘价' not in period_data or \
+                '日最高价' not in period_data or '日最低价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少价格或成交量数据")
+
+        close_df = period_data['收盘价']
+        open_df = period_data['开盘价']
+        high_df = period_data['日最高价']
+        low_df = period_data['日最低价']
+        volume_df = period_data['成交量']
+        N = 6
+
+        # 1. 计算核心比率: (Close - Open) / (High - Low)
+        # 避免除以零: 当 High=Low 时，该比率为 NaN (或设为0)
+        price_range = high_df - low_df
+        # 使用 np.divide 安全地执行除法，并用 where 避免除零
+        ratio_df = np.divide(close_df - open_df, price_range,
+                             out=np.zeros_like(price_range, dtype=float),
+                             where=price_range != 0)
+
+        # 2. 计算加权成交量: Ratio * Volume
+        weighted_volume = ratio_df * volume_df
+
+        # 3. 计算 N=6 周期移动平均 (SMA)
+        WVAD_df = weighted_volume.rolling(window=N).mean()
+
+        # 截面排名
+        factor_df = WVAD_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_EP_Factor(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: EP (盈利收益率)
+        公式: 1 / PE，然后进行截面排名。
+        """
+        if 'PE' not in period_data:
+            raise ValueError("缺少PE数据")
+
+        PE_df = period_data['PE']
+
+        # 避免除零和极端值：PE > 0 才有意义
+        EP_df = 1.0 / PE_df.mask(PE_df <= 0)
+
+        # 截面排名 (rank(axis=1))
+        factor_df = EP_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_ROE_Factor(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: ROE (净资产收益率)
+        公式: ROE，然后进行截面排名。
+        """
+        if 'ROE' not in period_data:
+            raise ValueError("缺少ROE数据")
+
+        ROE_df = period_data['ROE']
+
+        # 对ROE进行截面排名
+        factor_df = ROE_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_EPS_Growth_Factor(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: EPS_Growth (250日EPS增长率)
+        公式: (EPS / 250周期前EPS) - 1，然后进行截面排名。
+        """
+        if 'EPS' not in period_data:
+            raise ValueError("缺少EPS数据")
+
+        EPS_df = period_data['EPS']
+
+        # EPS 过去 250 个周期（约一年）前的数值
+        EPS_lagged = EPS_df.shift(30)
+
+        # 计算增长率
+        growth_df = (EPS_df / EPS_lagged) - 1
+
+        # 截面排名
+        factor_df = growth_df.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_Turnover20_Factor(self, period_data: Dict) -> pd.DataFrame:
+        """
+        因子: Turnover20 (20日平均换手率)
+        公式: 20日换手率的简单移动平均 (SMA)，然后进行截面排名。
+        """
+        if '换手率' not in period_data:
+            raise ValueError("缺少换手率数据")
+
+        turnover_df = period_data['换手率']
+
+        # 计算20日简单移动平均
+        SMA_turnover = turnover_df.rolling(window=20).mean()
+
+        # 截面排名
+        factor_df = SMA_turnover.rank(axis=1, pct=True)
+
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_momentum_value_composite(self, period_data: Dict) -> pd.DataFrame:
+        """
+        动量-价值复合因子
+        公式: rank(ROC20) * rank(1/PE)
+        结合中期动量与价值低估
+        """
+        if '收盘价' not in period_data or 'PE' not in period_data:
+            raise ValueError("缺少收盘价或PE数据")
+
+        close_df = period_data['收盘价']
+        pe_df = period_data['PE']
+
+        # 20日动量
+        roc20 = (close_df / close_df.shift(20) - 1)
+
+        # 价值因子 (盈利收益率)
+        ep = 1.0 / pe_df.mask(pe_df <= 0)
+
+        # 复合因子
+        composite = roc20.rank(axis=1, pct=True) * ep.rank(axis=1, pct=True)
+
+        factor_df = composite.rank(axis=1, pct=True)
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_vol_adjusted_value(self, period_data: Dict) -> pd.DataFrame:
+        """
+        波动率调整价值因子
+        公式: rank(EP) / rank(波动率)
+        在价值因子上考虑风险调整
+        """
+        if 'PE' not in period_data or '收盘价' not in period_data:
+            raise ValueError("缺少PE或收盘价数据")
+
+        pe_df = period_data['PE']
+        close_df = period_data['收盘价']
+
+        # 盈利收益率
+        ep = 1.0 / pe_df.mask(pe_df <= 0)
+
+        # 20日波动率
+        volatility = close_df.pct_change().rolling(20).std()
+
+        # 波动率调整价值
+        vol_adjusted_ep = ep.rank(axis=1, pct=True) / (volatility.rank(axis=1, pct=True) + 1e-6)
+
+        factor_df = vol_adjusted_ep.rank(axis=1, pct=True)
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_volume_price_divergence(self, period_data: Dict) -> pd.DataFrame:
+        """
+        量价背离因子
+        公式: rank(价格动量) - rank(成交量动量)
+        捕捉量价背离的技术信号
+        """
+        if '收盘价' not in period_data or '成交量' not in period_data:
+            raise ValueError("缺少收盘价或成交量数据")
+
+        close_df = period_data['收盘价']
+        volume_df = period_data['成交量']
+
+        # 5日价格动量
+        price_momentum = close_df.pct_change(5)
+
+        # 5日成交量动量
+        volume_momentum = volume_df.pct_change(5)
+
+        # 量价背离
+        divergence = price_momentum.rank(axis=1, pct=True) - volume_momentum.rank(axis=1, pct=True)
+
+        factor_df = divergence.rank(axis=1, pct=True)
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def calculate_profitability_growth(self, period_data: Dict) -> pd.DataFrame:
+        """
+        盈利能力增长因子
+        公式: rank(ROE变化率) * rank(EBITDA增长率)
+        捕捉盈利能力的改善趋势
+        """
+        if 'ROE' not in period_data or 'EBITDA' not in period_data:
+            raise ValueError("缺少ROE或EBITDA数据")
+
+        roe_df = period_data['ROE']
+        ebitda_df = period_data['EBITDA']
+
+        # ROE 60日变化率
+        roe_growth = (roe_df / roe_df.shift(60) - 1)
+
+        # EBITDA 60日增长率
+        ebitda_growth = (ebitda_df / ebitda_df.shift(60) - 1)
+
+        # 复合增长因子
+        growth_factor = roe_growth.rank(axis=1, pct=True) * ebitda_growth.rank(axis=1, pct=True)
+
+        factor_df = growth_factor.rank(axis=1, pct=True)
+        factor_df.columns.name = 'code'
+        factor_df.index.name = 'date'
+        return factor_df.dropna(how='all')
+
+    def prepare_panel_data(self, factor_name: str) -> pd.DataFrame:
+        """
+        准备面板数据 (统一处理基础因子和每日滚动合成因子)
+        - 将所有时间序列宽表转为长表并合并
+        """
+        panel_data = []
+
+        for period_name, period_data in self.all_data.items():
+            factor_df = None
+
+            # 优先检查合成因子 (现已改为每日滚动计算，返回时间序列宽表)
+            if factor_name in self.synthetic_factors and period_name in self.synthetic_factors[factor_name]:
+                factor_df = self.synthetic_factors[factor_name][period_name]
+            # 其次检查基础因子 (本身就是时间序列宽表)
+            elif factor_name in period_data:
+                factor_df = period_data[factor_name]
+
+            if factor_df is not None and not factor_df.empty:
+                # 使用 stack 将宽表 (Index=date, Columns=code) 转为长表
+                try:
+                    long_factor_df = factor_df.stack().reset_index()
+                    long_factor_df.columns = ['date', 'code', factor_name]
+                    long_factor_df['period'] = period_name
+                    panel_data.append(long_factor_df)
+                except Exception as e:
+                    print(f"⚠️  {period_name} - {factor_name} 数据转换失败: {e}")
+                    continue
+
+        result_df = pd.concat(panel_data, ignore_index=True) if panel_data else pd.DataFrame()
+
+        if not result_df.empty:
+            # 确保日期是 datetime 类型
+            result_df['date'] = pd.to_datetime(result_df['date'])
+            print(f"\n✅ 因子 '{factor_name}' 面板数据:")
+            print(f"   时间点: {result_df['date'].nunique()}")
+            print(f"   股票数: {result_df['code'].nunique()}")
+            print(f"   总记录: {len(result_df)}")
+        else:
+            print(f"\n⚠️  因子 '{factor_name}' 无数据")
+
+        return result_df
+
+    def calculate_returns(self) -> pd.DataFrame:
+        """计算收益率"""
+        returns_data = []
+
+        for period_name, period_data in self.all_data.items():
+            if '收盘价' in period_data:
+                close_df = period_data['收盘价']
+                # 计算日收益率
+                returns_df = close_df.pct_change()
+
+                # 将收益率宽表转为长表
+                long_returns_df = returns_df.stack().reset_index()
+                long_returns_df.columns = ['date', 'code', 'return']
+                returns_data.append(long_returns_df)
+
+        result_df = pd.concat(returns_data, ignore_index=True) if returns_data else pd.DataFrame()
+
+        if not result_df.empty:
+            # 确保日期是 datetime 类型
+            result_df['date'] = pd.to_datetime(result_df['date'])
+            # 清理 Inf/-Inf (除以0可能产生)
+            result_df = result_df.replace([np.inf, -np.inf], np.nan).dropna(subset=['return'])
+            print(f"\n📈 收益率数据: {len(result_df)} 条记录")
+        return result_df
+
+    def analyze_factor(self, factor_name: str, plot: True):
+        """分析单个因子"""
+        print(f"\n{'=' * 60}")
+        print(f"🔍 分析因子: {factor_name}")
+        print(f"{'=' * 60}")
+
+
+        # 准备因子数据 (已是每日时间序列)
+        factor_df = self.prepare_panel_data(factor_name)
+        if factor_df.empty:
+            print(f"❌ 因子 {factor_name} 无数据")
+            return
+
+        # 准备收益数据
+        returns_df = self.calculate_returns()
+
+        # 合并数据
+        # 统一列名以供下一步分析
+        merged_data = factor_df.merge(returns_df, on=['date', 'code'], how='inner')
+
+        if merged_data.empty:
+            print("❌ 无有效数据用于分析")
+            dates = factor_df['date'].unique()
+            if len(dates) <= 1:
+                print("提示：当前数据集中交易日过少，无法进行 T->T+1 的时间序列分析。")
+            return
+
+        print(f"✅ 合并数据: {len(merged_data)} 条记录")
+        print(f"   时间范围: {merged_data['date'].min()} 到 {merged_data['date'].max()}")
+        print(f"   股票数量: {merged_data['code'].nunique()}")
+
+        # 执行分析
+        results, daily_returns = self._perform_analysis(merged_data, factor_name)
+
+        # 可视化
+        if plot:
+            self._create_plots(results, factor_name, merged_data)
+            if 'long_short_returns' in daily_returns and not daily_returns['long_short_returns'].empty:
+                self._plot_cumulative_return(daily_returns['long_short_returns'], factor_name)
+
+        self.factor_results[factor_name] = results
+        return results
+
+    def _perform_analysis(self, data: pd.DataFrame, factor_name: str) -> tuple[Dict, Dict]:
+        """执行因子分析 (已修复 T->T+1 匹配逻辑, 增加IC自相关性和多空组合收益序列)"""
+        results = {}
+        daily_returns = {}  # 用于存储多空组合每日收益序列
+
+        # IC分析
+        ic_series = []
+        Rankic_series = []
+        # 获取所有唯一的、按升序排列的日期
+        dates = sorted(data['date'].unique())
+
+        # 用于分档分析 (每日多空收益)
+        long_short_daily_returns = []
+
+        # 注意：这里 date[i] 是因子日期 T，date[i+1] 是收益率日期 T+1
+        for i in range(len(dates) - 1):
+            current_date = dates[i]
+            next_date = dates[i + 1]
+
+            # T 日的因子值
+            current_factors = data[data['date'] == current_date][['code', factor_name]].copy()
+            # T+1 日的收益率
+            next_returns = data[data['date'] == next_date][['code', 'return']].copy()
+
+            # 合并 T 日因子和 T+1 日收益
+            merged = current_factors.merge(next_returns, on='code', how='inner')
+
+            if len(merged) > 20:  # 最小股票数量要求 (为分档多空留出余量)
+                # --- RankIC 计算 ---
+                ic = merged[factor_name].corr(merged['return'], method='pearson')
+                Rankic = merged[factor_name].corr(merged['return'], method='spearman')
+                if not np.isnan(ic):
+                    ic_series.append(ic)
+                if not np.isnan(Rankic):
+                    Rankic_series.append(Rankic)
+
+                # --- 分档多空收益计算 ---
+                try:
+                    # T日分档
+                    merged['decile'] = pd.qcut(
+                        merged[factor_name], 10, labels=False, duplicates='drop'
+                    )
+
+                    # 确保分档在 0-9 之间
+                    if merged['decile'].min() == 0 and merged['decile'].max() == 9:
+                        # 最高档 (9) 平均收益 - 最低档 (0) 平均收益
+                        return_9 = merged[merged['decile'] == 9]['return'].mean()
+                        return_0 = merged[merged['decile'] == 0]['return'].mean()
+                        long_short_return = return_9 - return_0
+                        long_short_daily_returns.append(pd.Series(long_short_return, index=[next_date]))
+                except Exception:
+                    # 可能数据不足导致分档失败，跳过这一天
+                    pass
+
+        if ic_series:
+            # IC序列的索引应该对应收益率日期 (T+1 日)
+            ic_series = pd.Series(ic_series, index=dates[1:len(ic_series) + 1])
+            ic_series = ic_series[(ic_series != 0) & (ic_series.notna()) & (ic_series != '')]
+            monthly_ic_mean = ic_series.resample('M').mean()
+            annual_ic_mean = ic_series.resample('Y').mean()
+            Rankic_series = pd.Series(Rankic_series, index=dates[1:len(Rankic_series) + 1])
+            Rankic_series = Rankic_series[(Rankic_series != 0) & (ic_series.notna()) & (Rankic_series != '')]
+            results['ic_series'] = ic_series
+            results['annual_ic_mean'] = annual_ic_mean.mean()
+            results['monthly_ic_mean'] = monthly_ic_mean.mean()
+            results['Rankic_series'] = Rankic_series
+            results['ic_mean'] = ic_series.mean()
+            results['Rankic_mean'] = Rankic_series.mean()
+            results['ic_std'] = ic_series.std()
+            results['ir'] = results['ic_mean'] / results['ic_std'] if results['ic_std'] != 0 else 0
+            results['win_rate'] = (ic_series > 0).mean() if results['ic_mean'] >= 0 else (ic_series < 0).mean()
+            results['factor_direction'] = '正因子' if results['ic_mean'] > 0 else '负因子'
+
+            # 补充：IC 自相关性
+            autocorr_1 = self._calculate_ic_autocorrelation(ic_series, lag=1)
+            results['ic_autocorr_1'] = autocorr_1
+
+            print(f"📊 IC分析结果:")
+            print(f"   IC均值: {results['ic_mean']:.4f}")
+            print(f"   月度IC均值: {results['monthly_ic_mean']:.4f}")
+            print(f"   年度IC均值: {results['annual_ic_mean']:.4f}")
+            print(f"   RankIC均值: {results['Rankic_mean']:.4f}")
+            # print(f"   IC标准差: {results['ic_std']:.4f}")
+            print(f"   IR: {results['ir']:.3f}")
+            print(f"   胜率: {results['win_rate']:.2%}")
+            print(f"   IC自相关性 (Lag 1): {autocorr_1:.4f}")
+            print(f"   因子方向: {results['factor_direction']}")
+
+        # 每日多空组合收益序列
+        if long_short_daily_returns:
+            daily_returns['long_short_returns'] = pd.concat(long_short_daily_returns)
+
+        # 分档分析 (与 IC 分析使用相同的 T->T+1 错位逻辑)
+        decile_returns_mean = self._decile_analysis_mean(data, factor_name)
+        if decile_returns_mean is not None:
+            results['decile_returns_mean'] = decile_returns_mean
+            results['monotonicity'] = self._calculate_monotonicity(decile_returns_mean)
+            print(f"   单调性: {results['monotonicity']:.3f}")
+
+        return results, daily_returns
+
+    def _calculate_ic_autocorrelation(self, ic_series: pd.Series, lag: int = 1) -> float:
+        """
+        计算 IC 序列的自相关性
+        """
+        if len(ic_series) <= lag:
+            return 0.0
+        # 将序列错位 lag 期
+        lagged_ic = ic_series.shift(lag)
+        # 计算 Pearson 相关系数 (IC 值本身就是数值，用 Pearson 即可)
+        # 排除 NaN 值
+        valid_data = pd.DataFrame({'ic': ic_series, 'lagged_ic': lagged_ic}).dropna()
+
+        if len(valid_data) < 2:
+            return 0.0
+
+        corr, _ = pearsonr(valid_data['ic'], valid_data['lagged_ic'])
+        return corr
+
+    def _decile_analysis_mean(self, data: pd.DataFrame, factor_name: str) -> Optional[pd.Series]:
+        """分档组合分析 (返回所有期平均收益)"""
+        try:
+            all_decile_returns = []
+            dates = sorted(data['date'].unique())
+
+            for i in range(len(dates) - 1):
+                # T 日的因子数据
+                current_data = data[data['date'] == dates[i]].copy()
+                # T+1 日的收益数据
+                next_data = data[data['date'] == dates[i + 1]]
+
+                if len(current_data) < 20:  # 最少20只股票
+                    continue
+
+                # 当前期分档 (T日)
+                # 使用 labels=False 返回分档数字 0-9
+                current_data['decile'] = pd.qcut(
+                    current_data[factor_name], 10, labels=False, duplicates='drop'
+                )
+
+                # 合并下一期收益 (T+1日)
+                merged = current_data.merge(
+                    next_data[['code', 'return']], on='code', suffixes=('', '_next'), how='inner'
+                )
+
+                if not merged.empty:
+                    # 计算每个分档在 T+1 日的平均收益
+                    decile_return = merged.groupby('decile')['return_next'].mean()
+                    all_decile_returns.append(decile_return)
+
+            if all_decile_returns:
+                # 对所有时间段的平均收益取平均
+                # 重新设置索引名
+                mean_returns = pd.DataFrame(all_decile_returns).mean()
+                mean_returns.index = [f'Decile {i + 1}' for i in mean_returns.index]
+                return mean_returns
+
+        except Exception as e:
+            print(f"分档分析错误: {e}")
+
+        return None
+
+    def _calculate_monotonicity(self, decile_returns: pd.Series) -> float:
+        """计算单调性"""
+        if len(decile_returns) < 2:
+            return 0
+        # 对分档数字 (0, 1, ..., 9) 和平均收益进行相关性分析
+        ranks = np.arange(len(decile_returns))
+        correlation = np.corrcoef(ranks, decile_returns.values)[0, 1]
+        return correlation if not np.isnan(correlation) else 0
+
+    def _create_plots(self, results: Dict, factor_name: str, data: pd.DataFrame):
+        # 简洁三色配色
+        colors = ['#1f77b4', '#d62728', '#7f7f7f']  # 蓝色、红色、灰色
+        # 图：分档组合收益柱状图
+        if 'decile_returns_mean' in results and len(results['decile_returns_mean']) > 0:
+            plt.figure(figsize=(10, 7))  # 增加图表尺寸，为标签留出更多空间
+            decile_returns = results['decile_returns_mean']
+            x_labels = [i for i in range(1, len(decile_returns) + 1)]
+            # 平均日收益转年化收益
+            annualized_returns = (1 + decile_returns.values) ** 252 - 1
+            y_data_percent = annualized_returns * 100  # 年化百分比收益
+
+            bar_width = 1.0
+            bars = plt.bar(x_labels, y_data_percent,
+                           width=bar_width,
+                           color=colors[0], alpha=1, edgecolor='white', linewidth=0.5)
+
+            # 负收益柱子用红色
+            for i, bar in enumerate(bars):
+                height = bar.get_height()
+                if height < 0:
+                    bar.set_color(colors[1])
+
+            # --- 核心修改：标签位置优化 (防止重叠) ---
+            # 确定图表的Y轴实际数据显示范围，为标签偏移量提供参考
+            y_min_data, y_max_data = np.min(y_data_percent), np.max(y_data_percent)
+            y_data_span = y_max_data - y_min_data
+
+            # 设置一个基于数据范围的动态最小偏移量
+            # 确保即使数据量很小，标签也能有清晰的间距
+            min_label_offset = max(y_data_span * 0.03, 0.005)  # 最小偏移量为数据范围的3%或0.005%
+
+            for i, bar in enumerate(bars):
+                height = bar.get_height()
+
+                # 标签文本
+                label_text = f'{height:.2f}%'
+
+                # 根据柱子高度正负，决定标签的垂直对齐和初始偏移方向
+                if height >= 0:
+                    va = 'bottom'
+                    # 标签放在柱子上方的固定偏移量
+                    offset = min_label_offset
+                else:
+                    va = 'top'
+                    # 标签放在柱子下方的固定偏移量
+                    offset = -min_label_offset
+
+                # 如果柱子高度为0，特殊处理标签位置，直接在0线稍上方显示
+                if np.isclose(height, 0, atol=0.001):  # 使用 np.isclose 处理浮点数接近0的情况
+                    label_text = '0.00%'
+                    va = 'bottom'
+                    offset = min_label_offset  # 确保在0线之上
+
+                # 绘制标签
+                plt.text(bar.get_x() + bar.get_width() / 2, height + offset,
+                         label_text, ha='center', va=va,
+                         fontsize=10,
+                         color='black'  # 统一标签颜色
+                         )
+
+            plt.xlim(0.5, len(decile_returns) + 0.5)
+
+            # --- 关键修改 2: 优化Y轴范围和刻度 ---
+            # 确保Y轴包含所有数据点和其标签
+            # 获取所有标签的y位置，以便确定一个合适的Y轴上限
+            all_y_labels_pos = []
+            for i, bar in enumerate(bars):
+                height = bar.get_height()
+                if height >= 0:
+                    all_y_labels_pos.append(height + min_label_offset)
+                else:
+                    all_y_labels_pos.append(height - min_label_offset)
+
+            # 结合数据本身的范围和标签的最高/最低位置来设置Y轴
+            current_y_min = y_min_data
+            current_y_max = y_max_data
+
+            # 如果有标签，确保Y轴能覆盖所有标签
+            if all_y_labels_pos:
+                current_y_max = max(current_y_max, np.max(all_y_labels_pos))
+                current_y_min = min(current_y_min, np.min(all_y_labels_pos))
+
+            # 增加额外的上下边距，使图表不拥挤
+            # 根据实际数据范围动态调整 Y 轴的上下边界
+            # 避免当所有收益都集中在狭窄区间时，图表仍然显得太空
+            y_range_padding = (current_y_max - current_y_min) * 0.15  # 增加15%的上下边距
+
+            # 确保 Y 轴下限不会过高，如果所有值都是正数，确保能看到0线
+            y_lower_bound = min(current_y_min - y_range_padding,
+                                0 if y_min_data > 0 else current_y_min - y_range_padding)
+            y_upper_bound = current_y_max + y_range_padding
+
+            if y_lower_bound == y_upper_bound:  # 避免除零错误或范围为0
+                y_lower_bound -= 0.1
+                y_upper_bound += 0.1
+
+            plt.ylim(y_lower_bound, y_upper_bound)
+
+            # 移除Y轴刻度标签，因为我们已经有柱顶标签
+            plt.yticks([])
+
+            plt.title(f'分档组合平均收益 - {factor_name}', fontsize=16, fontweight='bold', pad=20)  # 增加标题与图表的间距
+            plt.xlabel('分档 (1:最低, 10:最高)', fontsize=12)
+            plt.ylabel('年化平均收益 (%)', fontsize=12)
+            plt.xticks(x_labels, fontsize=10)  # 确保X轴刻度是 1 到 10
+            plt.axhline(y=0, color='black', linewidth=1)  # 0线
+            plt.grid(False)  # 移除背景网格
+
+            # 调整布局，防止元素重叠
+            plt.tight_layout()
+
+            # 保存到桌面
+            save_path = f'C:/Users/cufet/Desktop/{factor_name}_分档收益.png'
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"✅ 图表已保存到桌面: {save_path}")
+    #
+    def _plot_cumulative_return(self, daily_long_short_returns: pd.Series, factor_name: str):
+        """
+        绘制多空组合的累计走势图 (净值曲线)
+        """
+        # 计算累计收益率 (净值曲线：(1 + R1) * (1 + R2) * ... - 1)
+        # R = daily_returns
+        # 净值 = (1 + R).cumprod()
+        cumulative_returns = (1 + daily_long_short_returns).cumprod()
+
+        plt.figure(figsize=(10, 6))
+
+        # 绘制净值曲线
+        plt.plot(cumulative_returns.index, cumulative_returns.values,
+                 color='#d62728', linewidth=2, label='多空组合净值')
+
+        plt.title(f'多空组合累计净值走势 - {factor_name}', fontsize=14, fontweight='bold')
+        plt.xlabel('日期')
+        plt.ylabel('累计净值')
+        plt.grid(False, alpha=0)
+        plt.legend()
+
+        # 格式化x轴日期
+        plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m-%d'))
+        plt.gcf().autofmt_xdate()  # 自动旋转日期标签
+
+        # 保存到桌面
+        plt.savefig(f'C:/Users/cufet/Desktop/{factor_name}_累计走势图.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+        print(f"✅ 图表已保存到桌面: {factor_name}_累计走势图.png")
+
+        # ----------------------------------------------------
+
+    def _parse_sheet_and_fill(self, file_path, sheet_name: str) -> pd.DataFrame:
+        """
+        加载单个 Sheet 并应用脏宽表解析和填充逻辑。
+        这是一个辅助函数，将加载和解析逻辑集中起来。
+        """
+        try:
+            # 1. 确保传入 header=None，与 parse_dirty_wide_table 的逻辑匹配
+            sheet_data = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+
+            # 2. 调用核心解析函数
+            # 注意：这里的 sheet_name 已经被传入 parse_dirty_wide_table，将触发内部的 0 值填充逻辑
+            parsed_data = self.parse_dirty_wide_table(sheet_data, sheet_name)
+
+            # 3. 返回空表或有效数据
+            if parsed_data.empty:
+                return pd.DataFrame()
+
+            # 【注意】：随机模拟逻辑已包含在 parse_dirty_wide_table 内部，这里无需重复调用。
+
+            return parsed_data
+
+        except Exception as e:
+            # 捕获单个 Sheet 的错误，打印信息后返回空表
+            print(f"    ❌ 【{sheet_name}】解析失败。错误: {e}")
+            return pd.DataFrame()
+
+    def load_test_data(self):
+        """
+        专门用于测试集的加载方法：按文件遍历所有 Sheet，并确保数据被正确解析和填充。
+        """
+        # 1. 查找所有匹配的文件 (.xlsx 和 .xls)
+        excel_files = sorted(
+            list(self.data_folder.glob("中证500_*.xlsx")) +
+            list(self.data_folder.glob("中证500_*.xls"))
+        )
+
+        if not excel_files:
+            print("⚠️ 未找到本地 Excel 文件。此框架依赖完整 Excel 文件，请确认路径。")
+            return
+
+        print(f"找到 {len(excel_files)} 个数据文件")
+
+        for file in excel_files:
+            # 2. 【核心需求 1：去掉“中证500_”前缀】
+            period_name = file.stem.replace("中证500_", "")
+            print(f"\n📁 加载: {period_name}")
+
+            period_data = {}
+            try:
+                xl_file = pd.ExcelFile(file)
+
+                for sheet_name in xl_file.sheet_names:
+                    if sheet_name == 'Sheet1':
+                        # 股票基本信息表
+                        stock_info = pd.read_excel(file, sheet_name=sheet_name)
+                        period_data['stock_info'] = stock_info
+                    else:
+                        # 因子 Sheet：调用辅助函数进行加载和填充
+                        parsed_data = self._parse_sheet_and_fill(file, sheet_name)
+
+                        if not parsed_data.empty:
+                            period_data[sheet_name] = parsed_data
+
+                # 3. 存储数据
+                self.all_data[period_name] = period_data
+
+                # 打印加载成功的因子键
+                loaded_keys = [k for k in period_data.keys() if k != 'stock_info']
+                print(f"    ✅ {period_name} 文件加载完成，包含 {len(loaded_keys)} 个因子数据项。Keys: {loaded_keys}")
+
+            except Exception as e:
+                print(f"❌ 加载文件 {file.name} 失败: {e}")
+
+        # 显示数据概览
+        if self.all_data:
+            self._display_data_overview()
+
+    def load_data(self):
+        """
+        加载指定文件夹中的所有 Excel 文件，解析，并进行数据预处理（例如缺失值填充）。
+        """
+        print(f"🚀 开始加载数据...")
+
+        data_files = list(self.data_folder.glob("*.xlsx"))
+        print(f"找到 {len(data_files)} 个数据文件")
+
+        for file_path in data_files:
+            file_name_without_ext = file_path.stem
+
+            print(f"\n📁 加载: {file_name_without_ext}")
+
+            # 假设每个 Excel 文件中包含了所有因子和收益率数据
+            try:
+                raw_data = pd.read_excel(file_path, header=None)
+                # 使用你已有的解析方法
+                data_period = self.parse_dirty_wide_table(raw_data)
+
+                # 对原始财务数据进行随机向前模拟填充（这部分逻辑应该来自你原有的代码）
+                # 假设 parse_dirty_wide_table 返回的数据包含了所有列
+                for factor_name in ['ROE', '自由现金流', 'EPS', 'EBITDA']:
+                    if factor_name in data_period:
+                        print(f"   🔧 正在对 {factor_name} 进行 **随机向前模拟** 填充...")
+                        # 假设你有一个 fill_random_forward 方法或类似逻辑
+                        data_period[factor_name] = self.fill_random_forward(data_period[factor_name])
+
+                self.all_data[file_name_without_ext] = data_period
+                print(f"✅ {file_name_without_ext} 加载完成")
+
+            except Exception as e:
+                print(f"❌ 加载文件 {file_path} 失败: {e}")
+
+        print("\n" + "=" * 60)
+        print("数据加载概览")
+        print("=" * 60)
+        for period_name in self.all_data.keys():
+            print(f"📅 时间段: {period_name}")
+
+    def aggregate_factor_panel(self, factor_names: List[str], target_return_name: str = 'return'):
+        factor_panel_data = {}
+        for factor_name in factor_names:
+            factor_panel_data[factor_name] = self.prepare_panel_data(factor_name)
+
+        # 2. 准备收益率数据 (长表)
+        # 假设 calculate_returns 返回的长表也包含 'date', 'code', 'return'
+        returns_df = self.calculate_returns()
+
+        # 3. 将所有因子面板合并到收益率上
+        final_merged_data = returns_df.copy()
+
+        for factor_name, factor_df in factor_panel_data.items():
+            if factor_df.empty:
+                continue
+
+            # 使用 date 和 code 作为 merge 的键
+            final_merged_data = final_merged_data.merge(
+                factor_df[['date', 'code', factor_name]],
+                on=['date', 'code'],
+                how='inner'
+            )
+
+        # 4. 清理和返回
+        required_columns = factor_names + [target_return_name]
+        final_data_clean = final_merged_data.dropna(subset=required_columns)
+
+        X_final = final_data_clean[factor_names].copy()
+        y_final = final_data_clean[target_return_name].copy()
+
+        # **致命错误修正点：确保索引正确设置**
+        # 在 merge 之后，'date' 和 'code' 仍然是列。为了让 LASSO 使用 MultiIndex，我们需要设置它。
+
+        # 我们需要获取对齐后的 (date, code) 索引，并将它设置给 X_final
+        # 此时 final_data_clean 仍是带有 date, code 列的 DataFrame
+
+        X_final['date'] = final_data_clean['date']
+        X_final['code'] = final_data_clean['code']
+        y_final = y_final.set_axis(X_final.index)  # 确保 Series 的 index 是对齐的
+
+        if not X_final.empty:
+            # **关键修复：将 date 和 code 设置为 MultiIndex**
+            X_final = X_final.set_index(['date', 'code'])
+            y_final.index = X_final.index
+        else:
+            # 如果数据为空，返回空对象
+            return pd.DataFrame(), pd.Series()
+
+        print(f"✅ 聚合数据对齐完成。用于训练的 (日期-股票) 样本总数: {len(X_final)}")
+
+        return X_final, y_final
+
+def _get_aligned_data_for_lasso(analyzer, factor_names, target_return_name='return'):
+
+    print("🔍 正在聚合因子面板数据...")
+
+    # 1. 准备所有因子数据 (X)
+    all_factor_panels = []
+
+    for factor_name in factor_names:
+        # 使用框架自带的 prepare_panel_data 获取长表
+        factor_panel = analyzer.prepare_panel_data(factor_name)
+        if not factor_panel.empty:
+            # 确保只保留日期、代码和因子值
+            factor_panel = factor_panel[['date', 'code', factor_name]]
+            all_factor_panels.append(factor_panel)
+
+    if not all_factor_panels:
+        print("⚠️ 无法获取任何因子数据。")
+        return pd.DataFrame(), pd.Series()
+
+    # 2. 依次合并所有因子面板数据
+    merged_factors = all_factor_panels[0]
+    for i in range(1, len(all_factor_panels)):
+        merged_factors = merged_factors.merge(
+            all_factor_panels[i],
+            on=['date', 'code'],
+            how='inner'  # 确保只有所有因子都有值的样本被保留
+        )
+
+    # 3. 准备目标收益率 (Y)
+    returns_df = analyzer.calculate_returns()
+
+    # 4. 合并因子和收益率，实现最终对齐
+    final_merged_data = merged_factors.merge(
+        returns_df[['date', 'code', target_return_name]],
+        on=['date', 'code'],
+        how='inner'
+    )
+
+    # 5. 清理和分割
+    final_merged_data = final_merged_data.dropna()
+
+    # 分割 X (特征) 和 Y (目标)
+    X = final_merged_data[['date', 'code'] + factor_names]
+    Y = final_merged_data[target_return_name]
+
+    print(f"✅ 数据对齐完成。用于训练的 (日期-股票) 样本总数: {len(X)}")
+
+    return X, Y
+
+def calculate_lasso_composite(
+        analyzer,
+        factor_names,
+        alpha=0
+):
+    X_panel, Y = analyzer._get_aligned_data_for_lasso(analyzer, factor_names, target_return_name='return')
+
+    if X_panel.empty:
+        print("❌ 无法训练 LASSO：对齐后的数据为空。")
+        # 返回一个空的 DataFrame 以满足 calculate_synthetic_factor 的要求
+        return pd.DataFrame()
+
+        # 提取纯特征矩阵进行训练
+    X_train = X_panel[factor_names].values
+
+    # 2. 执行 LASSO 回归
+    print(f"\n🧠 开始 LASSO 回归 (Alpha={alpha})...")
+    lasso_model = Lasso(alpha=alpha, max_iter=100)
+    lasso_model.fit(X_train, Y.values)
+
+    # 3. 记录和保存模型
+    print(f"\n--- LASSO 模型结果 (Alpha={alpha}) ---")
+    print(f"截距 (Intercept): {lasso_model.intercept_:.6f}")
+    print("选定的因子及其系数:")
+    # 打印非零系数
+    for name, coef in zip(factor_names, lasso_model.coef_):
+        if np.abs(coef) > 1e-6:
+            print(f"  {name}: {coef:.6f}")
+    # 将模型对象和特征顺序一起保存，以便在新数据上重用
+    model_data = {
+        'model': lasso_model,
+        'feature_names': factor_names  # 关键：保存训练时的特征顺序
+    }
+    MODEL_OUTPUT_PATH = "C:/Users/cufet/Desktop/lasso_composite_model.joblib"  # 确保路径可写
+    joblib.dump(model_data, MODEL_OUTPUT_PATH)
+    print(f"\n✅ LASSO 模型和特征顺序已保存到: {MODEL_OUTPUT_PATH}")
+    # 4. 生成复合因子值
+    # 复合因子值 = 训练集上的预测值
+    composite_factor_values = lasso_model.predict(X_train)
+    # 5. 组装成时间序列宽表 (满足 analyzer.calculate_synthetic_factor 的要求)
+
+    # 创建长表 Series
+    composite_factor_long = pd.Series(
+        composite_factor_values,
+        index=X_panel.index,  # 使用训练数据的 index
+        name="LASSO_Composite_Value"
+    )
+
+    # 将日期、代码、复合因子值合并
+    result_long_df = X_panel[['date', 'code']].copy()
+    result_long_df['LASSO_Composite'] = composite_factor_long.values
+
+    # 找到当前 period 的数据并转换回宽表
+    current_period_name = list(analyzer.all_data.keys())[0]  # 这是一个临时的、不严谨的假设！
+
+
+    return result_long_df.set_index('date').pivot(columns='code', values='LASSO_Composite').fillna(
+        0)  # 这是一个不严谨的宽表，但结构上符合要求。
+
+
+def train_and_save_lasso_model(analyzer, feature_names: List[str], alpha: float, model_path: str):
+    """
+    聚合因子面板数据，将它们与收益率对齐，标准化后训练 LASSO 模型，并保存模型和 Scaler。
+    """
+    print("\n🔍 正在聚合因子面板数据...")
+
+    # 1. 聚合因子数据和收益率数据
+    X_merged, y_merged = analyzer.aggregate_factor_panel(feature_names)
+
+    if X_merged.empty or y_merged.empty:
+        print("⚠️ 警告：聚合数据为空，无法训练 LASSO 模型。")
+        return
+
+    # 将聚合后的数据转换为 NumPy 数组
+    X_values = X_merged.values
+    y_values = y_merged.values
+
+    # ----------------------------------------------------
+    # **【修正 1：关键：对输入特征 X 进行标准化 (Standardization)】**
+    # ----------------------------------------------------
+    # 初始化标准化器
+    scaler = StandardScaler()
+
+    # 对特征数据进行拟合和转换 (Fit and Transform)，scaler 会学习数据的均值和标准差
+    X_values_standardized = scaler.fit_transform(X_values)
+
+    print(f"✅ 数据对齐完成。用于训练的 (日期-股票) 样本总数: {X_values_standardized.shape[0]}")
+
+    # 2. 训练 LASSO 模型
+    # 提示：由于数据已标准化，alpha 通常需要调小
+    lasso_model = Lasso(alpha=alpha, max_iter=10000, random_state=42)
+
+    # 确保模型训练使用标准化后的数据
+    print(f"拟合 LASSO 模型 (样本数: {X_values_standardized.shape[0]}, 特征数: {X_values_standardized.shape[1]})...")
+    lasso_model.fit(X_values_standardized, y_values)
+
+    # 3. 保存模型、特征顺序和 Scaler
+    # 必须保存 scaler，因为应用模型时需要用它来转换新的数据！
+    joblib.dump({
+        'model': lasso_model,
+        'feature_names': feature_names,
+        'scaler': scaler  # <-- 必须保存 Scaler 对象
+    }, model_path)
+
+    # 打印最终的模型参数以供检查
+    print(f"LASSO模型参数： {{'model': {lasso_model}, 'feature_names': {feature_names}}}")
+    print(f"✅ LASSO 模型、特征顺序和 Scaler 已保存到: {model_path}")
+# 2. 模型应用函数 (供 calculate_synthetic_factor 调用)
+def apply_lasso_composite_to_period(analyzer,period_name, factor_names, model_path):
+    """
+    为 CS500FactorAnalyzer.calculate_synthetic_factor 所需的计算函数。
+    它接收一个 period_data，应用模型并返回该 period 的宽表结果。
+    """
+    try:
+        # 1. 加载模型和特征顺序
+        loaded_data = joblib.load(model_path)
+        loaded_model = loaded_data['model']
+        # 确保这里加载的特征顺序和训练时一致
+        TRAINING_FACTOR_NAMES = loaded_data['feature_names']
+
+        # 2. 准备当前 period 的特征数据 (宽表)
+        period_factor_data = {}
+
+        # 获取当前 period 的原始数据
+        period_raw_data = analyzer.all_data.get(period_name, {})
+
+        for factor_name in factor_names:
+            # 尝试从**基础因子**中获取
+            if factor_name in period_raw_data:
+                period_factor_data[factor_name] = period_raw_data[factor_name]
+
+            # 尝试从 **已计算的合成因子** 中获取
+            elif factor_name in analyzer.synthetic_factors and period_name in analyzer.synthetic_factors[factor_name]:
+                period_factor_data[factor_name] = analyzer.synthetic_factors[factor_name][period_name]
+
+            # 如果找不到该因子，应该打印警告或跳过该周期
+            else:
+                # 这可能表示这个因子在当前周期确实没有被成功计算
+                print(f"   ⚠️  因子 '{factor_name}' 在周期 '{period_name}' 缺失，跳过此周期。")
+                return pd.DataFrame()
+
+                # 3. 将所有宽表合并成一个宽表
+        X_wide = pd.concat(period_factor_data.values(), axis=1, keys=period_factor_data.keys()).swaplevel(axis=1)
+        # 确保只保留与 TRAINING_FACTOR_NAMES 顺序一致的列 (去重并重新排序)
+        X_wide = X_wide.reindex(columns=TRAINING_FACTOR_NAMES, level=0)
+        X_wide.columns = X_wide.columns.droplevel(1)  # 删除多余的第二层列名
+
+        # 4. 移除缺失值并转换为 NumPy 数组 (X)
+        X_filled = X_wide.fillna(method='ffill')
+        X_train_period = X_filled.dropna(how='any').copy()
+        X_values = X_train_period.values
+        if X_values.size == 0:
+            return pd.DataFrame()
+
+        # 5. 应用模型进行预测
+        composite_values = loaded_model.predict(X_values)
+
+        # 6. 转换回时间序列宽表 (Index=date, Columns=code)
+
+        composite_df = pd.DataFrame(
+            composite_values,
+            index=X_train_period.index,
+            columns=X_train_period.columns  # 这里的列名是股票代码
+        )
+
+        # 返回宽表
+        composite_df.index.name = 'date'
+        composite_df.columns.name = 'code'
+
+        return composite_df
+
+    except Exception as e:
+        print(f"❌ LASSO 应用失败: {e}")
+        return pd.DataFrame()
+
+
+# 确保在 main 函数外定义这个创建器函数，并且保持 joblib.load 和模型变量的闭包
+def create_lasso_applier(analyzer, factor_names, model_path):
+    # 1. 模型加载和参数准备 (只执行一次)
+    loaded_data = joblib.load(model_path)
+    loaded_model = loaded_data['model']
+    TRAINING_FACTOR_NAMES = loaded_data['feature_names']
+    loaded_scaler = loaded_data['scaler']  # <-- 必须加载 Scaler
+
+    # 2. 返回内部的 apply_func
+    def apply_func(period_data):
+        # A. 查找当前的 period_name （通过内存地址比较，保持不变）
+        current_period_name = None
+        for name, data in analyzer.all_data.items():
+            if data is period_data:
+                current_period_name = name
+                break
+
+        if current_period_name is None:
+            return pd.DataFrame()
+
+        # B. 核心：从 analyzer 的两个地方获取数据（保持不变）
+        period_factor_data = {}
+        for factor_name in TRAINING_FACTOR_NAMES:
+            if factor_name in period_data:
+                period_factor_data[factor_name] = period_data[factor_name]
+            elif factor_name in analyzer.synthetic_factors and current_period_name in analyzer.synthetic_factors[
+                factor_name]:
+                period_factor_data[factor_name] = analyzer.synthetic_factors[factor_name][current_period_name]
+            else:
+                # 缺少任一因子则返回空 DataFrame
+                # print(f"DEBUG: Period {current_period_name} missing factor {factor_name}")
+                return pd.DataFrame()
+
+        # 3. 将所有宽表（Index=Date, Columns=Code）转为 Long-Panel（MultiIndex=(Date, Code), Columns=Feature）
+        X_long_list = []
+        for factor_name, factor_df in period_factor_data.items():
+            # 使用 stack() 将宽表转为长表，并将其命名为因子名称
+            long_factor = factor_df.stack().to_frame(factor_name)
+            X_long_list.append(long_factor)
+
+        # 将所有长表特征合并成一个特征矩阵 X_merged (按 (Date, Code) 索引对齐)
+        X_merged = pd.concat(X_long_list, axis=1)
+
+        # 确保列顺序与训练时一致
+        X_merged = X_merged[TRAINING_FACTOR_NAMES]
+
+        # 4. 填充并清理（注意：ffill 默认在 axis=0 上运行，即时间轴）
+        X_filled = X_merged.fillna(method='ffill').fillna(method='bfill')  # 额外增加 bfill 确保首日数据可用
+        X_train_period = X_filled.dropna(how='any').copy()
+        X_values = X_train_period.values
+
+        if X_values.size == 0:
+            # print(f"DEBUG: Period {current_period_name} resulted in zero valid samples after dropna.")
+            return pd.DataFrame()
+
+            # 5. 应用模型进行预测
+        composite_values = loaded_model.predict(X_values)
+
+        # 6. 转换回时间序列宽表
+        # composite_values 是预测得分 (1D 数组)，索引是 MultiIndex(Date, Code)
+        composite_series = pd.Series(
+            composite_values,
+            index=X_train_period.index,  # MultiIndex (Date, Code)
+            name='LASSO_Composite_Value'
+        )
+
+        # 使用 unstack(level='code') 将 Series (MultiIndex) 转换回宽表 (Index=Date, Columns=Code)
+        composite_df = composite_series.unstack(level='code')
+
+        # 7. 清理和返回
+        composite_df.index.name = 'date'
+        composite_df.columns.name = 'code'
+
+        return composite_df
+
+    return apply_func
+
+
+def main():
+    analyzer = CS500FactorAnalyzer(data_folder="C:/Users/cufet/Desktop/投资组合管理")
+
+    # 1. 加载数据
+    print("🚀 开始加载数据...")
+    analyzer.load_all_periods()
+
+    # 2. 计算合成因子
+    print("\n🔧 开始计算合成因子...")
+    # Alpha因子的计算逻辑已修改为每日滚动
+    # analyzer.calculate_synthetic_factor("Alpha#1", analyzer.calculate_alpha1)
+    # analyzer.calculate_synthetic_factor("Alpha#2", analyzer.calculate_alpha2)
+    # analyzer.calculate_synthetic_factor("Alpha#3", analyzer.calculate_alpha3)
+    analyzer.calculate_synthetic_factor("ROC6", analyzer.calculate_ROC6)
+    # analyzer.calculate_synthetic_factor("BIAS60", analyzer.calculate_BIAS60)
+    analyzer.calculate_synthetic_factor("CCI20", analyzer.calculate_CCI20)
+    # analyzer.calculate_synthetic_factor("WVAD6", analyzer.calculate_WVAD6)
+    # analyzer.calculate_synthetic_factor("EP", analyzer.calculate_EP_Factor)
+    analyzer.calculate_synthetic_factor("ROE", analyzer.calculate_ROE_Factor)
+    # analyzer.calculate_synthetic_factor("EPS增长", analyzer.calculate_EPS_Growth_Factor)
+    # analyzer.calculate_synthetic_factor("Turnover20", analyzer.calculate_Turnover20_Factor)
+    analyzer.calculate_synthetic_factor("动量价值复合", analyzer.calculate_momentum_value_composite)
+    # analyzer.calculate_synthetic_factor("波动调整价值", analyzer.calculate_vol_adjusted_value)
+    analyzer.calculate_synthetic_factor("量价背离", analyzer.calculate_volume_price_divergence)
+    # analyzer.calculate_synthetic_factor("盈利增长", analyzer.calculate_profitability_growth)
+
+    global all_factors
+    all_factors = [
+        "ROC6",  "CCI20",
+         "ROE",
+        "动量价值复合","量价背离"
+    ]###"Alpha#1", "Alpha#2", "Alpha#3", "BIAS60","WVAD6", "EP",  "EPS增长","波动调整价值" ,  "盈利增长","Turnover20","量价背离"
+    MODEL_PATH = "C:/Users/cufet/Desktop/lasso_composite_model.joblib"  # 保存路径
+
+    print("\n🧠 开始 LASSO 训练和模型保存...")
+    train_and_save_lasso_model(analyzer, all_factors, alpha=0, model_path=MODEL_PATH)
+
+    # LASSO 步骤 3：计算并存储复合因子 (在框架循环中应用已保存的模型)
+    print("\n🔧 开始计算 LASSO 复合因子 (应用模型)...")
+    # 使用 lambda 函数调用应用逻辑，并将模型路径传递进去
+    lasso_applier_func = create_lasso_applier(analyzer, all_factors, MODEL_PATH)
+
+    analyzer.calculate_synthetic_factor(
+        "LASSO_Composite",
+        lasso_applier_func  # 传入闭包函数
+    )
+
+    def print_lasso_coefficients(model_path):
+        """加载模型并打印每个因子的权重系数"""
+        try:
+            # 1. 加载保存的数据
+            loaded_data = joblib.load(model_path)
+            loaded_model = loaded_data['model']
+            feature_names = loaded_data['feature_names']
+
+            # 2. 提取系数
+            coefficients = loaded_model.coef_
+
+            # 3. 将因子名称和系数配对
+            coef_df = pd.DataFrame({
+                'Factor': feature_names,
+                'Coefficient': coefficients
+            }).sort_values(by='Coefficient', key=lambda x: np.abs(x), ascending=False)
+
+            print("\n============================================================")
+            print(f" LASSO 复合因子权重 (Alpha={loaded_model.alpha})")
+            print("============================================================")
+            print(coef_df.to_string(index=False))  # to_string 确保完整显示
+            print("============================================================")
+
+            # 补充：检查有多少个系数被压缩到零
+            zero_count = (np.abs(coefficients) < 1e-6).sum()
+            print(f"被 LASSO 压缩到零的因子数量 (绝对值 < 1e-6): {zero_count} / {len(coefficients)}")
+
+        except Exception as e:
+            print(f"❌ 打印 LASSO 系数失败: {e}")
+
+    # 在分析因子之前调用这个函数
+    print_lasso_coefficients(MODEL_PATH)
+
+    # 3. 分析因子
+    print("\n📊 开始因子分析...")
+    # factors_to_analyze = ["Alpha#1"]  # , "Alpha#2", "Alpha#3"
+    # factors_to_analyze = ["Alpha#2"]
+    # factors_to_analyze = ["Alpha#3"]
+    # factors_to_analyze = ["ROC6"]
+    # factors_to_analyze = ["BIAS60"]
+    # factors_to_analyze = ["CCI20"]
+    # factors_to_analyze = ["WVAD6"]
+    # factors_to_analyze = ["EP"]
+    # factors_to_analyze = ["ROE"]
+    # factors_to_analyze = ["EPS增长"]
+    # factors_to_analyze = ["Turnover20"]
+    # factors_to_analyze = [
+    #     "动量价值复合",
+    #     "波动调整价值",
+    #     "量价背离",
+    #     "盈利增长"
+    # ]
+    factors_to_analyze = ["LASSO_Composite"]
+    for factor in factors_to_analyze:
+        analyzer.analyze_factor(factor,plot=True)
+
+
+def _load_close_prices(analyzer: CS500FactorAnalyzer) -> pd.DataFrame:
+    """
+    从 CS500FactorAnalyzer 中提取所有时间段的收盘价，并合并成一个大的面板数据（宽表）。
+    """
+    all_close_data = []
+
+    # analyzer.all_data 存储了按时间段划分的 '收盘价' 宽表
+    for period_name, period_data in analyzer.all_data.items():
+        if '收盘价' in period_data:
+            # 确保索引是日期，列是代码，值为收盘价
+            close_df = period_data['收盘价']
+            all_close_data.append(close_df)
+
+    # 按时间轴合并所有时间段的收盘价数据
+    # 注意：这里需要处理时间段间的日期重叠或断裂，Pandas的concat会自动按索引对齐
+    if not all_close_data:
+        raise ValueError("❌ 未在加载的数据中找到 '收盘价' 数据表。")
+
+    # 假设不同文件（period_name）数据的时间是连续或不重叠的
+    combined_close_df = pd.concat(all_close_data, axis=0, join='outer').sort_index()
+
+    # 去除重复的日期行（如果不同文件有重叠）
+    combined_close_df = combined_close_df[~combined_close_df.index.duplicated(keep='first')]
+
+    # 确保列名和索引名正确
+    combined_close_df.columns.name = 'code'
+    combined_close_df.index.name = 'date'
+
+    print(f"✅ 成功合并所有收盘价数据。共 {len(combined_close_df)} 个交易日。")
+    return combined_close_df
+
+
+# ====================================================================
+# **【回测核心类】LASSO 因子回测器**
+# ====================================================================
+
+class LassoBacktester:
+    """
+    基于 LASSO 复合因子的月度调仓策略回测器。
+    """
+
+    def __init__(self, start_capital: float = 1000000,
+                 top_n: int = 20,
+                 transaction_fee: float = 0.0005):
+
+        self.start_capital = start_capital
+        self.top_n = top_n  # 每次调仓选择的股票数量
+        self.fee = transaction_fee  # 单边交易费率 (万分之五 = 0.0005)
+        self.holdings_report = []  # 存储调仓报告（用于Excel输出）
+        self.NAV_curve = pd.Series()  # 净值曲线
+        self.monthly_returns = pd.Series()  # 月度收益率
+
+    def run_backtest(self, lasso_factor_df: pd.DataFrame, close_prices: pd.DataFrame):
+        """
+        执行回测主逻辑。
+
+        :param lasso_factor_df: 每日 LASSO 因子值 (长表: date, code, LASSO_Factor)
+        :param close_prices: 每日收盘价 (宽表: Index=date, Columns=code)
+        """
+
+        # 1. 识别月度调仓日 (取因子值存在的月末交易日)
+        lasso_factor_df['date'] = pd.to_datetime(lasso_factor_df['date'])
+
+        # 提取所有因子存在的日期
+        all_dates = sorted(lasso_factor_df['date'].unique())
+
+        # 筛选出每个月的最后一个交易日作为调仓日
+        monthly_rebalance_dates = pd.to_datetime(
+            pd.Series(all_dates).dt.to_period('M').drop_duplicates(keep='last').apply(lambda x: x.end_time).dt.date)
+
+        # 确保调仓日都在因子数据中（这一步很关键，防止用周末或非交易日计算）
+        rebalance_dates = [date for date in monthly_rebalance_dates if date in all_dates]
+
+        if len(rebalance_dates) < 2:
+            print("❌ 回测失败：数据时间跨度太短，无法进行至少一次月度调仓。")
+            return
+
+        current_capital = self.start_capital
+        NAV = 1.0  # 初始净值
+        NAV_data = {rebalance_dates[0]: NAV}  # 存储净值
+
+        print(f"\n📈 开始回测: 初始资金 {self.start_capital:,.2f} RMB，月度调仓 Top {self.top_n} 股票...")
+
+        # 迭代调仓日：从第一个调仓日 T_start 到 倒数第二个调仓日 T_end
+        for i in range(len(rebalance_dates) - 1):
+            date_t_start = rebalance_dates[i]  # T 期末（调仓日/买入日）
+            date_t_end = rebalance_dates[i + 1]  # T+1 期末（持有期结束/卖出日）
+
+            # --- 1. 选股 (T 日) ---
+
+            # 提取 T 日的因子数据
+            factors_at_t = lasso_factor_df[lasso_factor_df['date'] == date_t_start].set_index('code')
+
+            # 找到 LASSO 因子值最高的 Top N 股票
+            if 'LASSO_Factor' not in factors_at_t.columns:
+                print(f"❌ {date_t_start} 因子数据错误，未找到 'LASSO_Factor' 列。回测中止。")
+                break
+
+            # 降序排序，选取 Top N
+            selected_stocks = factors_at_t.sort_values(by='LASSO_Factor', ascending=False).head(self.top_n)
+            holdings = selected_stocks.index.tolist()
+
+            if not holdings:
+                print(f"⚠️ {date_t_start} 无有效股票可供选择，跳过调仓。")
+                # 资金和净值保持不变
+                NAV_data[date_t_end] = NAV
+                self.monthly_returns[date_t_end] = 0.0
+                continue
+
+            # --- 2. 收益计算 (T -> T+1) ---
+
+            # 获取 T 日和 T+1 日的收盘价
+            try:
+                price_t = close_prices.loc[date_t_start, holdings]
+                price_t_plus_1 = close_prices.loc[date_t_end, holdings]
+            except KeyError:
+                print(f"⚠️ 无法获取 {date_t_start} 或 {date_t_end} 的收盘价数据，跳过此月。")
+                NAV_data[date_t_end] = NAV
+                self.monthly_returns[date_t_end] = 0.0
+                continue
+
+            # 计算每支股票的持有期收益率 (T 到 T+1)
+            holding_returns = (price_t_plus_1 / price_t) - 1
+            holding_returns = holding_returns.dropna()  # 排除持有期内停牌或无数据的股票
+
+            # 调整持仓，仅保留有有效收益率的股票
+            final_holdings = holding_returns.index.tolist()
+
+            # 组合收益率 (等权平均)
+            if final_holdings:
+                # 组合收益率 = 等权投资下有效持仓的平均收益率
+                portfolio_return_gross = holding_returns.mean()
+            else:
+                # 选中股票全部停牌或无数据，收益为 0
+                portfolio_return_gross = 0.0
+
+            # --- 3. 成本计算和资金更新 ---
+
+            # 交易成本：在 T 日调仓时发生，对所有投入资金收取单边费率 (万分之五)
+            transaction_cost = current_capital * self.fee
+
+            # 投入资金净值 (T 日)
+            net_capital_for_investment = current_capital - transaction_cost
+
+            # 资金更新 (T+1 日)
+            current_capital_new = net_capital_for_investment * (1 + portfolio_return_gross)
+
+            # 实际月度收益率 (含费)
+            monthly_return_net = (current_capital_new / self.start_capital) / NAV - 1
+
+            # 更新净值
+            NAV *= (1 + monthly_return_net)
+            current_capital = current_capital_new
+
+            # --- 4. 记录和报告 ---
+
+            self.monthly_returns[date_t_end] = monthly_return_net
+            NAV_data[date_t_end] = NAV
+
+            # 记录报告数据
+            report_data = {
+                '调仓日期': date_t_start,
+                '结算日期': date_t_end,
+                '期初净资产': current_capital / (1 + portfolio_return_gross) + transaction_cost,  # 记录T日投入的本金
+                '期末净资产': current_capital,
+                '组合毛收益率': portfolio_return_gross,
+                '交易费率': self.fee,
+                '交易成本': transaction_cost,
+                '组合净收益率': monthly_return_net,
+                '当前净值': NAV,
+                '持仓股票': ', '.join(final_holdings),
+                '股票权重': f"等权 (1/{self.top_n})",
+                'LASSO因子值': selected_stocks['LASSO_Factor'].to_dict()
+            }
+            self.holdings_report.append(report_data)
+
+            print(
+                f"   > {date_t_start.strftime('%Y-%m')} 调仓: 净收益率: {monthly_return_net * 100:.2f}%, 净值: {NAV:.4f}")
+
+        self.NAV_curve = pd.Series(NAV_data).sort_index()
+        self.total_return = (self.NAV_curve.iloc[-1] - 1) * 100
+        print(f"\n✅ 回测完成！累计收益率: {self.total_return:.2f}%")
+
+    def generate_report(self):
+        """生成 Excel 报告和图表"""
+
+        if self.NAV_curve.empty:
+            print("❌ 回测未成功运行，无法生成报告。")
+            return
+
+        # 1. Excel 报告 (持仓、收益详情)
+        report_df = pd.DataFrame(self.holdings_report)
+        report_df = report_df[[
+            '调仓日期', '结算日期', '当前净值', '组合净收益率',
+            '期初净资产', '期末净资产', '交易成本', '持仓股票', '股票权重', 'LASSO因子值'
+        ]]
+
+        # 定义输出路径
+        report_path = Path("./LASSO_Backtest_Report.xlsx")
+
+        try:
+            report_df.to_excel(report_path, index=False)
+            print(f"\n📊 Excel 报告已成功输出到: {report_path.resolve()}")
+        except Exception as e:
+            print(f"❌ 报告输出到 Excel 失败: {e}")
+
+        # 2. 累计收益和权重总结
+        print("\n" + "=" * 50)
+        print(f"**【累计收益】**:\n   初始资金: {self.start_capital:,.2f} RMB")
+        print(f"   期末净值: {self.NAV_curve.iloc[-1]:.4f}")
+        print(f"   累计收益率: {self.total_return:.2f}%")
+        print(f"   最终资产: {self.start_capital * self.NAV_curve.iloc[-1]:,.2f} RMB")
+        print("-" * 50)
+        print(f"**【股票权重】**:\n   每次调仓选择 {self.top_n} 支股票，等权投资。")
+        print(f"   **单支股票权重**: {1 / self.top_n * 100:.2f}%")
+        print("-" * 50)
+
+        # 3. 绘制图表
+        self._plot_results()
+
+    def _plot_results(self):
+        """绘制净值曲线和月度收益柱状图"""
+
+        plt.figure(figsize=(14, 10))
+
+        # 绘制净值曲线
+        plt.subplot(2, 1, 1)
+        # 确保净值曲线的第一个点是初始日期
+        nav_plot = self.NAV_curve.copy()
+        nav_plot.index = nav_plot.index.strftime('%Y-%m-%d')
+
+        nav_plot.plot(kind='line', grid=True, title='组合净值曲线 (LASSO Top 20 等权策略)', color='blue')
+        plt.xlabel('日期')
+        plt.ylabel('净值 (初始 = 1)')
+        plt.grid(True, linestyle='--', alpha=0.6)
+
+        # 绘制月度收益
+        plt.subplot(2, 1, 2)
+        monthly_ret_plot = self.monthly_returns.mul(100)
+        monthly_ret_plot.index = monthly_ret_plot.index.strftime('%Y-%m')  # 月度收益以月为单位显示
+
+        # 根据收益正负设置颜色
+        colors = ['red' if x > 0 else 'green' for x in monthly_ret_plot]
+        monthly_ret_plot.plot(kind='bar', color=colors, title='组合月度收益率 (含交易费)')
+
+        plt.axhline(0, color='black', linestyle='-', linewidth=1.0)
+        plt.xlabel('月份')
+        plt.ylabel('收益率 (%)')
+        plt.xticks(rotation=45)
+        plt.grid(axis='y', linestyle='--', alpha=0.6)
+
+        plt.tight_layout()
+        plt.show()
+
+
+def run_backtest_strategy():
+    """执行完整的因子计算、模型应用和回测流程。"""
+
+    # --- 1. 初始化和因子计算设置 (沿用您的原有逻辑) ---
+    all_factors = {
+        # "alpha1": CS500FactorAnalyzer.calculate_alpha1,
+        # "alpha2": CS500FactorAnalyzer.calculate_alpha2,
+        # "alpha3": CS500FactorAnalyzer.calculate_alpha3,
+        "ROC6": CS500FactorAnalyzer.calculate_ROC6,
+        # "BIAS60": CS500FactorAnalyzer.calculate_BIAS60,
+        "CCI20": CS500FactorAnalyzer.calculate_CCI20,
+        # "WVAD6": CS500FactorAnalyzer.calculate_WVAD6,
+        # "EP": CS500FactorAnalyzer.calculate_EP_Factor,
+        "ROE": CS500FactorAnalyzer.calculate_ROE_Factor,
+        # "EPS_Growth": CS500FactorAnalyzer.calculate_EPS_Growth_Factor,
+        # "Turnover20": CS500FactorAnalyzer.calculate_Turnover20_Factor,
+        "动量价值": CS500FactorAnalyzer.calculate_momentum_value_composite,
+        # "波动调整价值": CS500FactorAnalyzer.calculate_vol_adjusted_value,
+        "量价背离": CS500FactorAnalyzer.calculate_volume_price_divergence,
+        # "盈利增长": CS500FactorAnalyzer.calculate_profitability_growth,
+    }
+
+    # 您原文件中定义的测试集路径
+    TEST_DATA_PATH = r"C:\\Users\\cufet\\Desktop\\测试集"
+
+    print("\n" + "=" * 60)
+    print(f"🚀 开始测试集分析和回测：加载数据自路径 {TEST_DATA_PATH}")
+    print("=" * 60)
+
+    # 1. 初始化并加载测试集数据
+    test_analyzer = CS500FactorAnalyzer(TEST_DATA_PATH)
+    # 假设 load_all_periods 已经针对您的测试集文件夹进行过适当修改
+    test_analyzer.load_all_periods()
+
+    # 2. 在测试集上计算所有输入因子
+    # 这一步假设 run_factor_calculations 函数在您的原文件中定义
+    # 它应该循环调用 all_factors 中的函数并存储结果到 test_analyzer.synthetic_factors
+    print("\n🔧 正在计算所有原始输入因子...")
+
+    # 由于我无法访问 run_factor_calculations 的定义，这里简化为直接调用
+    # 假设您有一个辅助函数 run_factor_calculations(analyzer, factors)
+    # run_factor_calculations(test_analyzer, all_factors)
+
+    # 临时替代 run_factor_calculations
+    for factor_name, func in all_factors.items():
+        test_analyzer.calculate_synthetic_factor(factor_name, func)
+
+    print("✅ 所有输入因子计算完成。")
+
+    # 3. 应用 LASSO 复合因子模型
+    # 这一步假设您的原文件中有 create_lasso_applier 函数来生成 LASSO 复合因子长表
+
+    # 假设 MODEL_PATH 存在且模型已加载
+    MODEL_PATH = r"C:\Users\cufet\Desktop\lasso_composite_model.joblib"
+
+
+    try:
+        lasso_model = joblib.load(MODEL_PATH)
+        print(f"✅ 成功加载 LASSO 模型：{MODEL_PATH}")
+    except FileNotFoundError:
+        print(f"❌ 错误：未找到模型文件 {MODEL_PATH}，无法计算 LASSO 因子。")
+        return
+
+    # 假设您已有一个函数来汇总所有因子并应用 LASSO 模型
+    # 由于无法访问您的 create_lasso_applier 或 apply_lasso_model 的具体实现
+    # 我假设这一步的最终产出是一个名为 `lasso_factor_panel_df` 的 DataFrame:
+
+    # 模拟 LASSO 因子计算步骤：
+    all_factor_data = []
+    for factor_name in all_factors.keys():
+        panel_df = test_analyzer.prepare_panel_data(factor_name)
+        if not panel_df.empty:
+            all_factor_data.append(panel_df)
+
+    if not all_factor_data:
+        print("❌ 错误：没有因子数据可用于 LASSO 应用。回测中止。")
+        return
+
+    # 合并所有因子 (可能会很慢)
+    all_factors_combined = all_factor_data[0]
+    for df in all_factor_data[1:]:
+        # 使用 date 和 code 作为键进行合并
+        # all_factors_combined = all_factors_combined.merge(df, on=['date', 'code'], how='inner')
+        # 合并所有因子 (可能会很慢)
+        all_factors_combined = all_factor_data[0]
+
+        for df in all_factor_data[1:]:
+            # 核心修改：在合并前，删除当前因子DataFrame (df) 中冗余的 'period' 列
+            if 'period' in df.columns:
+                df = df.drop(columns=['period'])
+
+                # 使用 date 和 code 作为键进行合并
+            all_factors_combined = all_factors_combined.merge(
+                df,
+                on=['date', 'code'],
+                how='inner'
+            )
+
+    # 准备进行 LASSO 预测
+    feature_cols = [col for col in all_factors_combined.columns if col not in ['date', 'code', 'period']]
+
+    if not feature_cols:
+        print("❌ 错误：合并后无特征列可供预测。回测中止。")
+        return
+
+    # 标准化 (通常模型要求)
+    X_test = all_factors_combined[feature_cols].values
+    # 假设训练时使用的 StandardScaler 在这里不可用，我们进行本地简单标准化
+    scaler = StandardScaler()
+    X_test_scaled = scaler.fit_transform(X_test)
+
+    # 1. 您提供的 5 个因子系数
+    custom_coefs = np.array([
+        0.006833,  # Factor 1
+        0.000282,  # Factor 2
+        0.000088,  # Factor 3
+        0.000055,  # Factor 4
+        -0.000018  # Factor 5
+    ])
+
+    # 2. 检查系数数量是否与特征数量匹配 (安全检查)
+    num_features = X_test_scaled.shape[1]
+    if len(custom_coefs) != num_features:
+        print(
+            f"❌ 严重错误：您提供的 {len(custom_coefs)} 个系数与数据中的 {num_features} 个特征数量不匹配。请检查您的特征列！")
+        return
+
+    # 3. 构造一个虚拟的 Lasso 实例
+    # alpha值无关紧要，因为我们将手动设置 coef_
+    lasso_model = Lasso(alpha=0.0001)
+
+    # 4. 赋值系数和常数项
+    lasso_model.coef_ = custom_coefs
+    lasso_model.intercept_ = 0.0  # 您指定没有常数项
+
+    print("✅ 已根据您提供的系数手动构造 LASSO 复合因子模型。")
+
+    # 应用 LASSO 模型
+    lasso_predictions = lasso_model.predict(X_test_scaled)
+
+    # 创建 LASSO 因子结果 DataFrame
+    lasso_factor_panel_df = all_factors_combined[['date', 'code']].copy()
+    lasso_factor_panel_df['LASSO_Factor'] = lasso_predictions * 100
+
+
+    print(f"✅ LASSO 复合因子计算完成。共 {len(lasso_factor_panel_df)} 条记录。")
+
+    output_path = r'C:\Users\cufet\Desktop\LASSO_Factor_Results.xlsx'
+    lasso_factor_panel_df.to_excel(output_path, index=False)
+    print(f"💾 LASSO 复合因子值已保存至: {output_path}")
+
+# 执行策略
+run_backtest_strategy()
