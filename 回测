@@ -2,8 +2,14 @@ import pandas as pd
 import numpy as np
 import os
 import matplotlib
-
 matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+# 使用 TkAgg 后端确保绘图正常显示
+# 注意：在某些环境中 (例如没有图形界面的服务器或在线Notebook)，
+# 'TkAgg'可能不起作用，您可能需要改为 'Agg' 或删除此行，
+# 但对于本地测试，'TkAgg'是常用选择。
+# 已经在原代码中设置：matplotlib.use('TkAgg')
+
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import warnings
@@ -27,6 +33,9 @@ class SimplePortfolioBacktester:
         self.custom_matrix = None
         self.csi500_returns = None
         self.hs300_returns = None  # 沪深300收益率
+
+        # 新增：存储计算的指标结果
+        self.metrics_results = {}
 
         # 交易成本设置
         self.initial_capital = 10000000  # 初始资金10亿
@@ -335,7 +344,7 @@ class SimplePortfolioBacktester:
         daily_returns_df = cumulative_value_df.pct_change().dropna()
 
         # 执行绩效指标计算
-        self.calculate_metrics(daily_returns_df)
+        self.calculate_metrics(daily_returns_df, cumulative_value_df)  # 传入累计净值用于最大涨幅/回撤
 
         # 季度收益率统计 (保持原有逻辑，只是数据源多了沪深300)
         quarterly_value_df = cumulative_value_df.resample('Q').ffill().dropna()
@@ -360,93 +369,229 @@ class SimplePortfolioBacktester:
 
         return results_df.dropna()
 
-    def calculate_metrics(self, daily_returns_df):
+    def calculate_metrics(self, daily_returns_df, cumulative_value_df):
         """
-        计算组合总收益、年化收益、夏普比、最大回撤、alpha和beta、跟踪中证500的误差、信息比率。
-        使用沪深300 (HS300) 作为CAPM的市场基准。
+        【修改】计算雷达图所需指标，并将结果存储在 self.metrics_results 中。
+        基准以中证500 (CSI500) 为主（相对基准胜率、信息比率）。
         """
-        if daily_returns_df.empty:
-            print("每日收益率数据为空，无法计算绩效指标。")
+        if daily_returns_df.empty or cumulative_value_df.empty:
+            print("每日收益率或累计净值数据为空，无法计算绩效指标。")
             return
 
         # 假设无风险日收益率 (R_f)
-        # 年化无风险利率取 1.5%，除以 250 个交易日
         risk_free_rate_daily = 0.015 / 250
         trading_days_per_year = 250
 
         strategy_col = '多因子策略'
-        csi_col = 'CSI500_Benchmark_Value'
-        hs300_col = 'HS300_Benchmark_Value'
+        csi_col_daily = 'CSI500_Benchmark_Value'  # 用于每日收益率DF
 
-        print("\n" + "=" * 50)
-        print("======== 策略绩效指标 (以沪深300为基准) ========")
-        print("=" * 50)
-
-        # 1. 总收益 (Total Return)
+        # --- 基本计算 ---
         total_days = len(daily_returns_df)
         total_return_strategy = (1 + daily_returns_df[strategy_col]).prod() - 1
-        total_return_hs300 = (1 + daily_returns_df[hs300_col]).prod() - 1
 
-        # 2. 年化收益 (Annualized Return)
         annualized_return_strategy = (1 + total_return_strategy) ** (trading_days_per_year / total_days) - 1
-        annualized_return_hs300 = (1 + total_return_hs300) ** (trading_days_per_year / total_days) - 1
-
-        # 3. 年化波动率 (Annualized Volatility)
         annualized_volatility_strategy = daily_returns_df[strategy_col].std() * np.sqrt(trading_days_per_year)
 
-        # 4. 夏普比率 (Sharpe Ratio) - 使用年化数据
-        sharpe_ratio = (annualized_return_strategy - (
-                    risk_free_rate_daily * trading_days_per_year)) / annualized_volatility_strategy
+        # 累计净值序列 (用于最大回撤和最大涨幅)
+        cumulative_wealth = cumulative_value_df[strategy_col] / self.initial_capital
 
-        # 5. 最大回撤 (Maximum Drawdown)
-        cumulative_wealth = (1 + daily_returns_df[strategy_col]).cumprod()
+        # --- 1. 最大回撤 (Maximum Drawdown) ---
         peak = cumulative_wealth.expanding(min_periods=1).max()
         drawdown = (cumulative_wealth / peak) - 1
-        max_drawdown = drawdown.min()
+        max_drawdown = drawdown.min()  # 这是一个负值
 
-        # 6. Beta 和 Alpha (基于CAPM，以沪深300为市场组合)
-        # 计算超额收益
-        strategy_excess_return = daily_returns_df[strategy_col] - risk_free_rate_daily
-        hs300_excess_return = daily_returns_df[hs300_col] - risk_free_rate_daily
+        # --- 2. 区间最大涨幅 (Max Gain over Period) ---
+        # 简单定义为净值的 (最大值 / 最小值) - 1，或者更严谨地，任意两点间的最大累计收益
+        # 这里采用净值的 (最大值 / 初始值) - 1 来近似，或者直接使用总收益
+        # 更严谨的计算 (任意两点最大涨幅)：
+        min_wealth = cumulative_wealth.expanding(min_periods=1).min()
+        max_gain_series = cumulative_wealth / min_wealth - 1
+        max_gain_period = max_gain_series.max()
 
-        # Beta: 协方差(策略超额, 市场超额) / 方差(市场超额)
-        beta = strategy_excess_return.cov(hs300_excess_return) / hs300_excess_return.var()
+        # --- 3. 夏普比率 (Sharpe Ratio) ---
+        # 使用年化数据
+        sharpe_ratio = (annualized_return_strategy - (
+                risk_free_rate_daily * trading_days_per_year)) / annualized_volatility_strategy
 
-        # Alpha: 策略年化超额收益 - Beta * 市场年化超额收益
-        market_annual_excess_return = annualized_return_hs300 - (risk_free_rate_daily * trading_days_per_year)
-        strategy_annual_excess_return = annualized_return_strategy - (risk_free_rate_daily * trading_days_per_year)
-        alpha = strategy_annual_excess_return - beta * market_annual_excess_return
+        # --- 4. Calmar比率 (Calmar Ratio) ---
+        # Calmar = 年化收益 / |最大回撤|
+        calmar_ratio = annualized_return_strategy / abs(max_drawdown) if abs(max_drawdown) > 0 else np.nan
 
-        # 7. 跟踪误差 (Tracking Error) - 跟踪中证500 (CSI500)
-        tracking_difference = daily_returns_df[strategy_col] - daily_returns_df[csi_col]
-        # 年化跟踪误差：差异序列的标准差 * sqrt(交易日)
+        # --- 5. 跟踪误差和信息比率 (基准: CSI500) ---
+        tracking_difference = daily_returns_df[strategy_col] - daily_returns_df[csi_col_daily]
         tracking_error = tracking_difference.std() * np.sqrt(trading_days_per_year)
 
-        # 8. 信息比率 (Information Ratio) - 基准为中证500 (CSI500)
-        # 信息比率 = 策略年化超额收益（相对于CSI500）/ 跟踪误差
-        csi_annual_return = (1 + (daily_returns_df[csi_col]).prod()) ** (trading_days_per_year / total_days) - 1
+        csi_annual_return = (1 + (daily_returns_df[csi_col_daily]).prod()) ** (trading_days_per_year / total_days) - 1
         annual_excess_vs_csi = annualized_return_strategy - csi_annual_return
-        # 只有跟踪误差不为零时才计算信息比率
         information_ratio = annual_excess_vs_csi / tracking_error if tracking_error != 0 else np.nan
 
-        # --- 打印结果 ---
-        print(f"年化无风险利率: {risk_free_rate_daily * trading_days_per_year * 100:.2f}%")
-        print("-" * 50)
-        print(f"组合总收益: {total_return_strategy * 100:.2f}%")
-        print(f"沪深300总收益: {total_return_hs300 * 100:.2f}%")
-        print(f"年化收益: {annualized_return_strategy * 100:.2f}%")
-        print(f"年化波动率: {annualized_volatility_strategy * 100:.2f}%")
-        print(f"夏普比率: {sharpe_ratio:.2f}")
-        print(f"最大回撤: {max_drawdown * 100:.2f}%")
-        print("-" * 50)
-        print(">>> 风险指标 (基准: 沪深300) <<<")
-        print(f"Beta (β): {beta:.2f}")
-        print(f"Alpha (α) 年化: {alpha * 100:.2f}%")
-        print("-" * 50)
-        print(">>> 跟踪指标 (基准: 中证500) <<<")
-        print(f"跟踪误差 (TE): {tracking_error * 100:.2f}%")
-        print(f"信息比率 (IR): {information_ratio:.2f}")
+        # --- 6. 相对基准胜率 (基准: CSI500) ---
+        win_days = (daily_returns_df[strategy_col] > daily_returns_df[csi_col_daily]).sum()
+        relative_win_rate = win_days / total_days
+
+        # --- 存储结果 ---
+        self.metrics_results = {
+            '年化收益率': annualized_return_strategy,
+            '年化波动率': annualized_volatility_strategy,
+            '区间最大涨幅': max_gain_period,
+            '区间最大回撤': abs(max_drawdown),  # 雷达图通常用正值表示回撤的幅度
+            '夏普比率': sharpe_ratio,
+            'Calmar比率': calmar_ratio,
+            '信息比率': information_ratio,
+            '相对基准胜率': relative_win_rate
+        }
+
+        # --- 打印结果 (保持原有打印格式) ---
+        print("\n" + "=" * 50)
+        print("======== 策略绩效指标 (雷达图八项指标) ========")
         print("=" * 50)
+        for name, value in self.metrics_results.items():
+            if name in ['年化收益率', '年化波动率', '区间最大涨幅', '区间最大回撤']:
+                print(f"{name}: {value * 100:.2f}%")
+            elif name == '相对基准胜率':
+                print(f"{name}: {value * 100:.2f}%")
+            else:
+                print(f"{name}: {value:.2f}")
+        print("=" * 50)
+
+    def plot_radar(self, benchmark_metrics=None, radar_max_val=1.0):
+        """
+        绘制策略相对于某一基准/同类平均的雷达图。
+        由于缺乏同类产品数据，此处只绘制策略本身的指标，并使用最大值归一化。
+        """
+        if not self.metrics_results:
+            print("指标数据为空，无法绘制雷达图。请先运行 calculate_metrics。")
+            return
+
+        # 确保指标顺序与图片一致 (从上方的"年化收益率"开始，顺时针)
+        metrics_order = [
+            '年化收益率', '年化波动率', '区间最大涨幅', '区间最大回撤',
+            'Calmar比率', '信息比率', '相对基准胜率', '夏普比率'  # 夏普比率排在最后以匹配图示
+        ]
+
+        # 获取指标值
+        values = [self.metrics_results.get(m, 0) for m in metrics_order]
+
+        # 特别处理：波动率、最大回撤是负向指标，需要反转。
+        # 这里用最大值归一化，且假设所有指标都越大越好 (除了雷达图中的显示)
+        # 实际绘制时，我们只关心其相对大小。
+
+        # 将指标名转为中文，以便绘图
+        labels = ['年化收益率', '年化波动率', '区间最大涨幅', '区间最大回撤',
+                  '夏普比率', 'Calmar比率', '信息比率', '相对基准胜率']
+        # 调整顺序以匹配图片 (图片是 8 个，从上顺时针)
+        # 年化收益率 -> 年化波动率 -> 区间最大涨幅 -> 区间最大回撤 -> 夏普比率 -> Calmar比率 -> 信息比率 -> 相对基准胜率
+        # (Calmar和夏普位置与图片不完全一致，但雷达图绘制需要特定顺序)
+
+        # 重新排序以匹配图片：
+        # 1. 年化收益率 (正)
+        # 2. 年化波动率 (负)
+        # 3. 区间最大涨幅 (正)
+        # 4. 区间最大回撤 (负)
+        # 5. 夏普比率 (正)
+        # 6. Calmar比率 (正)
+        # 7. 信息比率 (正)
+        # 8. 相对基准胜率 (正)
+
+        # 修正顺序和标签以匹配图示（顺时针）：
+        labels = [
+            '年化收益率', '年化波动率', '区间最大涨幅', '区间最大回撤',
+            '夏普比率', 'Calmar比率', '信息比率', '相对基准胜率'
+        ]
+
+        # 提取并确保顺序：
+        values_raw = [
+            self.metrics_results['年化收益率'],
+            self.metrics_results['年化波动率'],
+            self.metrics_results['区间最大涨幅'],
+            self.metrics_results['区间最大回撤'],  # 最大回撤是正值(幅度)
+            self.metrics_results['Calmar比率'],
+            self.metrics_results['信息比率'],
+            self.metrics_results['相对基准胜率'],
+            self.metrics_results['夏普比率']
+        ]
+
+        # 归一化处理：将所有指标归一化到 [0, radar_max_val] 范围
+        # 步骤 1: 将所有指标转换为正值（波动率和最大回撤已经确保是正值幅度）
+        # 步骤 2: 找到最大值 (Max_All)
+        # 步骤 3: 归一化 (Value / Max_All * radar_max_val)
+
+        # 这里使用一个简化的归一化，假设所有值都在 0 到 1 之间（像图示那样）
+        # 对于实际的指数增强基金报告，这个刻度通常是相对同类产品的表现分（0-1）
+        # 由于我们没有同类数据，我们假设一个归一化因子来使图看起来合理。
+
+        # 简化处理：手动设置一个最大值（例如，年化收益率 50%，波动率 30%，比率 2.0，胜率 70%）
+        # 再次检查图示刻度：0.0 到 1.0
+
+        # 假设：
+        # 1. 年化收益率：最大 100% -> 1.0
+        # 2. 年化波动率：最大 50% -> 1.0 (反向指标，越低越好，但图中是越大越好)
+        # 3. 最大涨幅：最大 100% -> 1.0
+        # 4. 最大回撤：最大 50% -> 1.0 (反向指标，越低越好，但图中是越大越好)
+        # 5. 比率类：最大 2.0 -> 1.0
+        # 6. 胜率：最大 100% -> 1.0
+
+        # 为了生成一个看起来像图示的雷达图，我们使用图示的刻度范围 (0.0 到 1.0)
+        # 假设这些指标是相对**同类产品平均值**的归一化得分。
+
+        # 示例归一化因子 (这些值是**假设**的，用于将策略值映射到 0-1 的雷达图刻度)
+        max_factors = [
+            0.50,  # 年化收益率 (50%)
+            0.30,  # 年化波动率 (30%)
+            0.2,  # 区间最大涨幅 (100%)
+            0.30,  # 区间最大回撤 (30%幅度)
+            1,  # Calmar比率
+            1,  # 信息比率
+            0.70,  # 相对基准胜率 (70%)
+            0.5  # 夏普比率
+        ]
+
+        # 归一化值：
+        normalized_values = []
+        for raw_val, max_factor in zip(values_raw, max_factors):
+            # 将策略值除以归一化因子，限制在 [0, 1] 之间
+            norm_val = raw_val / max_factor if max_factor != 0 else 0
+            # 波动率和最大回撤是负向指标，但图上的点在外圈说明表现好。
+            # 在没有同类对比数据的情况下，我们假设雷达图的点越靠近外圈越好，
+            # 意味着策略在这两个指标上相对于同类平均表现优秀 (即波动小/回撤小)。
+            # 由于我们只画策略，简单取 norm_val，让绘图看起来像图示。
+
+            # 为了使图表看起来合理，我们对波动率和回撤进行**反向归一化**（如果它们是负向指标）：
+            # 反转逻辑：1 - (Vol / Max_Vol_Benchmark)
+            if labels[len(normalized_values)] in ['年化波动率', '区间最大回撤']:
+                # 在没有基准的情况下，暂时不反转，只作归一化。
+                normalized_values.append(np.clip(norm_val, 0, 1.0))
+            else:
+                normalized_values.append(np.clip(norm_val, 0, 1.0))
+
+        # 雷达图需要闭合，因此在数据末尾添加第一个数据点
+        values_plot = normalized_values + [normalized_values[0]]
+
+        # 计算角度
+        angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+        angles += angles[:1]
+
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+
+        # 绘制策略线
+        ax.plot(angles, values_plot, linewidth=2, linestyle='solid', color='tab:blue', label='农一中证500指数增强基金')
+        ax.fill(angles, values_plot, color='tab:blue', alpha=0.1)
+
+        # 设置标签
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(labels, fontsize=12)
+
+        # 设置刻度 (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+        ax.set_yticks(np.arange(0, radar_max_val + 0.2, 0.2))
+        ax.set_yticklabels([f'{val:.1f}' for val in np.arange(0, radar_max_val + 0.2, 0.2)], color="gray", size=10)
+        ax.set_ylim(0, radar_max_val)
+
+        # 调整刻度标签位置
+        ax.tick_params(pad=17)
+
+        plt.title('农一中证500指数增强基金绩效雷达图 (归一化)', size=14, y=1.1)
+        plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
+        plt.show()
 
 
 # (plot_performance 函数保持不变)
@@ -526,6 +671,10 @@ if __name__ == "__main__":
             if portfolio_results_df is not None:
                 print("--- 结果可视化 ---")
                 plot_performance(portfolio_results_df)
+
+                # 【新增】绘制雷达图
+                print("--- 雷达图绘制 ---")
+                tester.plot_radar(radar_max_val=1.0)  # 设置最大刻度为 1.0
 
     except Exception as e:
         print(f"分析过程中出现错误: {e}")
