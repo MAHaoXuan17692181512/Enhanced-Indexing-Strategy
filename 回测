@@ -4,13 +4,21 @@ import os
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
+
+import pandas as pd
+import numpy as np
+import os
+import matplotlib
+
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
 # 使用 TkAgg 后端确保绘图正常显示
 # 注意：在某些环境中 (例如没有图形界面的服务器或在线Notebook)，
 # 'TkAgg'可能不起作用，您可能需要改为 'Agg' 或删除此行，
 # 但对于本地测试，'TkAgg'是常用选择。
 # 已经在原代码中设置：matplotlib.use('TkAgg')
 
-import matplotlib.pyplot as plt
+
 import matplotlib.dates as mdates
 import warnings
 from datetime import timedelta
@@ -37,6 +45,9 @@ class SimplePortfolioBacktester:
         # 新增：存储计算的指标结果
         self.metrics_results = {}
 
+        # 【修改 1-1：新增属性】 收集每日持仓数据
+        self.daily_holdings_history = []
+
         # 交易成本设置
         self.initial_capital = 10000000  # 初始资金10亿
         self.buy_fee = 0.0003  # 买入费率 0.03% (万3)
@@ -45,6 +56,7 @@ class SimplePortfolioBacktester:
         self._load_all_data()
 
     def _load_all_data(self):
+        # ... (此方法保持不变) ...
         """加载所有数据：股票价格、自定义组合矩阵、中证500指数、沪深300指数。"""
 
         # 1. 加载股票收盘价 (原有逻辑不变)
@@ -171,6 +183,9 @@ class SimplePortfolioBacktester:
         hs300_value = self.initial_capital
         hs300_values = pd.Series(index=all_trading_dates, dtype=float)
 
+        # 【修改 1-2：清空历史记录】确保每次回测都从空列表开始
+        self.daily_holdings_history = []
+
         print(f"--- 回测开始，初始资金: {self.initial_capital / 10000:.0f} 万元 ---")
 
         # ... (初始建仓逻辑不变) ...
@@ -214,7 +229,34 @@ class SimplePortfolioBacktester:
         # --- 每日循环回测 ---
         # ==========================================================
 
+        # 记录前一日的持仓（用作今日期初）
+        prev_shares = {}
+
         for i, date in enumerate(all_trading_dates):
+
+            # 【修改 2-1：记录期初持仓】
+            # 当日调仓发生在日终，所以**当日开盘（期初）**持仓量是前一交易日的期末持仓量（即昨日的 `current_shares`）
+            # 注意：在第一天 i=0 时，prev_shares 即为初始建仓后的持仓。
+            initial_holdings_data = []
+            if i > 0:
+                try:
+                    open_prices = self.price_data.loc[date].to_dict()  # 用当日收盘价近似期初价格（简化处理）
+                except KeyError:
+                    open_prices = {}
+
+                # 记录期初持仓 (前一日的期末持仓)
+                for stock, shares in prev_shares.items():
+                    price = open_prices.get(stock, np.nan)
+                    if not pd.isna(price) and price > 0:
+                        initial_holdings_data.append({
+                            '日期': date,
+                            '股票代码': stock,
+                            '持仓类型': '期初',
+                            '持仓股数': shares,
+                            '收盘价': price,
+                            '持仓市值': shares * price
+                        })
+
             if i > 0:
                 # 假设年化无风险利率为 1.5%，按 365 天计息
                 daily_interest_rate = 0.015 / 365
@@ -228,16 +270,42 @@ class SimplePortfolioBacktester:
                 if len(current_shares) == 0:
                     portfolio_value = self.initial_capital
                 else:
+                    # 初始建仓日的期末持仓就是 current_shares
                     pass
+
+            # 【修改 2-2：在 i=0 时记录期初持仓（即初始建仓后的持仓）】
+            if i == 0 and len(current_shares) > 0:
+                try:
+                    initial_prices_at_close = self.price_data.loc[date].to_dict()
+                except KeyError:
+                    initial_prices_at_close = {}
+
+                for stock, shares in current_shares.items():
+                    price = initial_prices_at_close.get(stock, np.nan)
+                    if not pd.isna(price) and price > 0 and shares > 0:
+                        initial_holdings_data.append({
+                            '日期': date,
+                            '股票代码': stock,
+                            '持仓类型': '期初',
+                            '持仓股数': shares,
+                            '收盘价': price,
+                            '持仓市值': shares * price
+                        })
+
+            # 记录期初数据（如果是 i>0 的日期，这里已包含前一日的期末持仓；如果是 i=0 且有建仓，这里是初始持仓）
+            self.daily_holdings_history.extend(initial_holdings_data)
 
             # --- 步骤 2：增量调仓逻辑 (逻辑不变) ---
             if date in future_rebalance_dates:
+                # ... (调仓逻辑不变) ...
                 sell_fee_total = 0
                 buy_fee_total = 0
                 try:
                     current_prices = self.price_data.loc[date].to_dict()
                 except KeyError:
                     print(f"警告：调仓日 {date.strftime('%Y-%m-%d')} 价格数据缺失，跳过调仓。")
+                    # 在跳过调仓时，需要确保 prev_shares 在下一轮循环中仍是正确的
+                    prev_shares = current_shares.copy()
                     continue
                 new_weights = self.get_custom_weights_by_date(date)
                 current_market_value = sum(current_shares.get(stock, 0) * current_prices.get(stock, 0)
@@ -298,6 +366,8 @@ class SimplePortfolioBacktester:
             yesterday = all_trading_dates[i - 1] if i > 0 else date
             stock_market_value = 0
 
+            end_holdings_data = []  # 【修改 2-3：新增期末持仓数据列表】
+
             if current_shares:
                 portfolio_stocks = list(current_shares.keys())
                 try:
@@ -308,6 +378,9 @@ class SimplePortfolioBacktester:
                         cumulative_returns.loc[date] = portfolio_value
                         csi500_values.loc[date] = csi500_values.loc[yesterday]
                         hs300_values.loc[date] = hs300_values.loc[yesterday]  # 保持不变
+
+                        # 价格缺失时，期末持仓仍等于期初，但市值使用前一天的价格（跳过记录期末）
+                        prev_shares = current_shares.copy()
                         continue
                     else:
                         portfolio_value = self.initial_capital
@@ -316,6 +389,21 @@ class SimplePortfolioBacktester:
                     price = today_prices.get(stock, np.nan)
                     if not pd.isna(price) and price > 0:
                         stock_market_value += shares * price
+
+                        # 【修改 2-4：记录期末持仓数据】
+                        end_holdings_data.append({
+                            '日期': date,
+                            '股票代码': stock,
+                            '持仓类型': '期末',
+                            '持仓股数': shares,
+                            '收盘价': price,
+                            '持仓市值': shares * price
+                        })
+                if date in future_rebalance_dates:
+                    new_weights = self.get_custom_weights_by_date(date)
+                    # 过滤掉权重为0的股票的期末持仓记录
+                    end_holdings_data = [holding for holding in end_holdings_data
+                                         if new_weights.get(holding['股票代码'], 0) > 0]
 
             portfolio_value = stock_market_value + cash
 
@@ -332,6 +420,12 @@ class SimplePortfolioBacktester:
                 cumulative_returns.loc[date] = portfolio_value
                 csi500_values.loc[date] = csi500_value
                 hs300_values.loc[date] = hs300_value  # 记录沪深300净值
+
+            # 【修改 2-5：记录期末持仓数据】
+            self.daily_holdings_history.extend(end_holdings_data)
+
+            # 【修改 2-6：更新 prev_shares】 记录当前的持仓量，用作下一轮循环的期初持仓量
+            prev_shares = current_shares.copy()
 
         # 将净值数据合并，并计算每日收益率
         cumulative_value_df = pd.DataFrame({
@@ -369,7 +463,103 @@ class SimplePortfolioBacktester:
 
         return results_df.dropna()
 
+
+    def _output_holdings_to_excel(self, output_file_name="个股持仓市值详情.xlsx"):
+        """将收集到的每日持仓市值数据导出到 Excel，按调仓日分sheet，宽数据格式"""
+        if not self.daily_holdings_history:
+            print("持仓历史数据为空，不进行导出。")
+            return
+
+        df = pd.DataFrame(self.daily_holdings_history)
+        df['日期'] = pd.to_datetime(df['日期'])
+
+        # 只保留期末持仓数据
+        df = df[df['持仓类型'] == '期末']
+
+        # 获取调仓日列表
+        rebalance_dates = [
+            pd.to_datetime(col, errors='coerce')
+            for col in self.custom_matrix.columns
+            if pd.to_datetime(col, errors='coerce', dayfirst=False) is not pd.NaT
+        ]
+        rebalance_dates.sort()
+
+        output_path = os.path.join(self.data_path, output_file_name)
+
+    # 【修改位置】：在 _output_holdings_to_excel 方法中修改第一个调仓周期的逻辑
+        try:
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # 为每个调仓周期创建一个sheet
+                for i in range(len(rebalance_dates)):
+                    if i == 0:
+                        # 【修改】：第一个调仓周期：从数据开始日期到第一个调仓日（包含调仓日）
+                        start_date = df['日期'].min()
+                        end_date = rebalance_dates[i]
+                        # 【关键修改】：确保end_date不早于start_date，并且使用实际数据中的日期范围
+                        if end_date < start_date:
+                            # 如果调仓日早于数据开始日期，调整到数据开始日期
+                            end_date = start_date
+                        period_df = df[(df['日期'] >= start_date) & (df['日期'] <= end_date)]
+                        sheet_name = f"周期1_{end_date.strftime('%Y%m%d')}"
+                    else:
+                        # 中间调仓周期：从前一个调仓日后到当前调仓日
+                        start_date = rebalance_dates[i - 1] + timedelta(days=1)
+                        end_date = rebalance_dates[i]
+                        period_df = df[(df['日期'] >= start_date) & (df['日期'] <= end_date)]
+                        sheet_name = f"周期{i + 1}_{end_date.strftime('%Y%m%d')}"
+
+                    # 【新增】：如果period_df为空，跳过创建该sheet
+                    if period_df.empty:
+                        print(f"跳过空sheet: {sheet_name} (无数据)")
+                        continue
+
+                    # 转换为宽数据格式：横轴为日期，纵轴为股票代码
+                    pivot_df = period_df.pivot_table(
+                        index='股票代码',
+                        columns='日期',
+                        values='持仓市值',
+                        aggfunc='first'
+                    ).fillna(0)
+
+                    # 写入sheet
+                    pivot_df.to_excel(writer, sheet_name=sheet_name)
+                    print(f"创建sheet: {sheet_name}, 数据形状: {pivot_df.shape}")
+
+                # 最后一个调仓周期之后的数据
+                if rebalance_dates:
+                    last_rebalance = rebalance_dates[-1]
+                    last_period_df = df[df['日期'] > last_rebalance]
+                    if not last_period_df.empty:
+                        sheet_name = f"最后周期_{df['日期'].max().strftime('%Y%m%d')}"
+                        pivot_df = last_period_df.pivot_table(
+                            index='股票代码',
+                            columns='日期',
+                            values='持仓市值',
+                            aggfunc='first'
+                        ).fillna(0)
+                        pivot_df.to_excel(writer, sheet_name=sheet_name)
+                        print(f"创建sheet: {sheet_name}, 数据形状: {pivot_df.shape}")
+
+                # 【新增】：如果所有周期都为空，创建一个总览sheet
+                if len(writer.sheets) == 0:
+                    # 直接使用所有数据创建一个sheet
+                    pivot_df = df.pivot_table(
+                        index='股票代码',
+                        columns='日期',
+                        values='持仓市值',
+                        aggfunc='first'
+                    ).fillna(0)
+                    pivot_df.to_excel(writer, sheet_name="总览")
+                    print(f"创建总览sheet, 数据形状: {pivot_df.shape}")
+
+            print(f"\n成功导出个股持仓市值详情至: {output_path}")
+            print("格式：按调仓周期分sheet，宽数据格式（股票代码为行，日期为列）")
+
+        except Exception as e:
+            print(f"\n导出个股持仓市值详情失败: {e}")
+
     def calculate_metrics(self, daily_returns_df, cumulative_value_df):
+        # ... (此方法保持不变) ...
         """
         【修改】计算雷达图所需指标，并将结果存储在 self.metrics_results 中。
         基准以中证500 (CSI500) 为主（相对基准胜率、信息比率）。
@@ -455,6 +645,7 @@ class SimplePortfolioBacktester:
         print("=" * 50)
 
     def plot_radar(self, benchmark_metrics=None, radar_max_val=1.0):
+        # ... (此方法保持不变) ...
         """
         绘制策略相对于某一基准/同类平均的雷达图。
         由于缺乏同类产品数据，此处只绘制策略本身的指标，并使用最大值归一化。
@@ -495,17 +686,17 @@ class SimplePortfolioBacktester:
 
         # 修正顺序和标签以匹配图示（顺时针）：
         labels = [
-            '年化收益率', '年化波动率', '区间最大涨幅', '区间最大回撤',
-            '夏普比率', 'Calmar比率', '信息比率', '相对基准胜率'
-        ]
+            '超额收益率', '年化波动率',
+            '夏普比率', '信息比率', '相对基准胜率'
+        ]  # '区间最大涨幅', '区间最大回撤','Calmar比率',
 
         # 提取并确保顺序：
         values_raw = [
             self.metrics_results['年化收益率'],
             self.metrics_results['年化波动率'],
-            self.metrics_results['区间最大涨幅'],
-            self.metrics_results['区间最大回撤'],  # 最大回撤是正值(幅度)
-            self.metrics_results['Calmar比率'],
+            # self.metrics_results['区间最大涨幅'],
+            # self.metrics_results['区间最大回撤'],  # 最大回撤是正值(幅度)
+            # self.metrics_results['Calmar比率'],
             self.metrics_results['信息比率'],
             self.metrics_results['相对基准胜率'],
             self.metrics_results['夏普比率']
@@ -520,30 +711,16 @@ class SimplePortfolioBacktester:
         # 对于实际的指数增强基金报告，这个刻度通常是相对同类产品的表现分（0-1）
         # 由于我们没有同类数据，我们假设一个归一化因子来使图看起来合理。
 
-        # 简化处理：手动设置一个最大值（例如，年化收益率 50%，波动率 30%，比率 2.0，胜率 70%）
-        # 再次检查图示刻度：0.0 到 1.0
-
-        # 假设：
-        # 1. 年化收益率：最大 100% -> 1.0
-        # 2. 年化波动率：最大 50% -> 1.0 (反向指标，越低越好，但图中是越大越好)
-        # 3. 最大涨幅：最大 100% -> 1.0
-        # 4. 最大回撤：最大 50% -> 1.0 (反向指标，越低越好，但图中是越大越好)
-        # 5. 比率类：最大 2.0 -> 1.0
-        # 6. 胜率：最大 100% -> 1.0
-
-        # 为了生成一个看起来像图示的雷达图，我们使用图示的刻度范围 (0.0 到 1.0)
-        # 假设这些指标是相对**同类产品平均值**的归一化得分。
-
         # 示例归一化因子 (这些值是**假设**的，用于将策略值映射到 0-1 的雷达图刻度)
         max_factors = [
-            0.50,  # 年化收益率 (50%)
-            0.30,  # 年化波动率 (30%)
-            0.2,  # 区间最大涨幅 (100%)
-            0.30,  # 区间最大回撤 (30%幅度)
-            1,  # Calmar比率
-            1,  # 信息比率
-            0.70,  # 相对基准胜率 (70%)
-            0.5  # 夏普比率
+            0.3766,  # 年化收益率 (50%)
+            0.1984,  # 年化波动率 (30%)
+            # 0.2,  # 区间最大涨幅 (100%)
+            # 0.30,  # 区间最大回撤 (30%幅度)
+            # 1,  # Calmar比率
+            29.28,  # 信息比率
+            0.1718,  # 相对基准胜率 (70%)
+            0.29  # 夏普比率
         ]
 
         # 归一化值：
@@ -665,7 +842,7 @@ if __name__ == "__main__":
             print("--- 开始回测 ---")
             portfolio_results_df = tester.run_backtest(
                 start_date='2022-12-13',
-                end_date='2025-09-1'
+                end_date='2025-09-30'
             )
 
             if portfolio_results_df is not None:
@@ -675,6 +852,9 @@ if __name__ == "__main__":
                 # 【新增】绘制雷达图
                 print("--- 雷达图绘制 ---")
                 tester.plot_radar(radar_max_val=1.0)  # 设置最大刻度为 1.0
+
+                # 【修改 3：新增导出持仓数据】
+                tester._output_holdings_to_excel()
 
     except Exception as e:
         print(f"分析过程中出现错误: {e}")
